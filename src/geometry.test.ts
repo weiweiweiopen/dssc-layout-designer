@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   DEFAULT_CONFIG,
@@ -19,6 +19,10 @@ import {
 } from "./geometry";
 
 const EPSILON = 1e-8;
+
+// The synchronous 2–64-cell matrix can exceed the worker RPC timeout on CI.
+// Yield between cases so Vitest can receive progress acknowledgements.
+afterEach(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
 
 function config(overrides: Partial<DesignConfig> = {}): DesignConfig {
   // Known film/gap fixture: these tests exercise electrical / Voronoi geometry.
