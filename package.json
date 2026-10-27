@@ -10,23 +10,29 @@
     "manifest:dist": "node scripts/dist-manifest.mjs",
     "test": "vitest run",
     "test:browser": "node scripts/browser-smoke.mjs",
+    "test:browser:3d": "node scripts/review-browser-smoke.mjs",
+    "notices:dependencies": "node scripts/dependency-notices.mjs",
     "sync:app": "node scripts/sync-app.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.9",
+    "@react-three/fiber": "^9.8.2",
     "clipper-lib": "^6.4.2",
     "d3-delaunay": "^6.0.4",
     "fflate": "^0.8.2",
     "jspdf": "^4.2.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "svg2pdf.js": "^2.6.0"
+    "svg2pdf.js": "^2.6.0",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@types/clipper-lib": "^6.4.0",
     "@types/d3-delaunay": "^6.0.4",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
+    "@types/three": "^0.186.0",
     "@vitejs/plugin-react": "^5.0.2",
     "puppeteer-core": "^25.5.0",
     "typescript": "~5.9.2",

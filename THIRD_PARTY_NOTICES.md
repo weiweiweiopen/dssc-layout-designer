@@ -1,5 +1,35 @@
 # Third-Party Notices
 
+## 3D viewer
+
+Three.js, React Three Fiber and Drei provide the local WebGL review. Installed
+dependency license files are collected in `DEPENDENCY_LICENSES.txt` and included
+in the build's `THIRD_PARTY_NOTICES.txt`. React Three Fiber's npm package omits
+its root license file; the following is reproduced from the v9.8.2 tag:
+https://github.com/pmndrs/react-three-fiber/blob/v9.8.2/LICENSE
+
+MIT License
+
+Copyright (c) 2019-2025 Poimandres
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ## Voronoi Font
 
 The uppercase A-Z Voronoi typeface glyph data in

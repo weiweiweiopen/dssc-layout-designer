@@ -20,7 +20,7 @@ async function copyBuild(source, destination) {
   }
 }
 await copyBuild(join(project, "dist"), join(resources, "dist"));
-for (const name of ["README.md", "PROCESS_MODEL.md", "THIRD_PARTY_NOTICES.md"]) {
+for (const name of ["README.md", "DEVELOPMENT.md", "PROCESS_MODEL.md", "THIRD_PARTY_NOTICES.md", "DEPENDENCY_LICENSES.txt"]) {
   await copyFile(join(project, name), join(resources, name));
 }
 if (process.platform === "darwin") {

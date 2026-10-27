@@ -24,11 +24,15 @@ function HelpPopup({ help, keepOpen, hide }: {
   useLayoutEffect(() => {
     const box = help.anchor.getBoundingClientRect();
     const popup = ref.current!.getBoundingClientRect();
-    const preferredLeft = box.right + 8 + popup.width <= window.innerWidth - 8
+    const toolbar = help.anchor.closest(".view-toolbar");
+    // Side placement over a horizontal toolbar can cover neighboring buttons
+    // and swallow their clicks (especially the shared seal-stage checkbox).
+    const preferredLeft = toolbar ? box.left : box.right + 8 + popup.width <= window.innerWidth - 8
       ? box.right + 8 : box.left - popup.width - 8;
+    const preferredTop = toolbar ? toolbar.getBoundingClientRect().bottom + 6 : box.top;
     setPosition({
       left: Math.max(8, Math.min(preferredLeft, window.innerWidth - popup.width - 8)),
-      top: Math.max(8, Math.min(box.top, window.innerHeight - popup.height - 8)),
+      top: Math.max(8, Math.min(preferredTop, window.innerHeight - popup.height - 8)),
     });
   }, [help]);
   return createPortal(

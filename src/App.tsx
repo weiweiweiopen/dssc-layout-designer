@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   startTransition,
   useDeferredValue,
   useEffect,
@@ -27,6 +29,8 @@ import {
 } from "./model";
 import { electricalEstimate, migrateGlassHeight, sealProcess, updateProcessConfig } from "./process";
 import { zebraContactRegions } from "./contacts";
+import { parseReviewSettings, REVIEW_STORAGE_KEY, type ReviewSettings } from "./review-model";
+import { ReviewBoundary } from "./ReviewBoundary";
 import { Help, HelpProvider } from "./Help";
 import { PARAMETER_HELP } from "./parameter-help";
 import { useI18n, dictionaries } from "./i18n";
@@ -49,6 +53,13 @@ interface DerivedDesign {
   geometry: LayoutGeometry;
   pointCodeArtwork: PointCodeArtwork;
   assets: SvgAsset[];
+}
+
+const Review3D = lazy(() => import("./Review3D"));
+type AppView = PreviewMode | "review-3d";
+function loadReviewSettings() {
+  try { return parseReviewSettings(localStorage.getItem(REVIEW_STORAGE_KEY)); }
+  catch { return parseReviewSettings(null); }
 }
 
 interface ExportProgress {
@@ -311,14 +322,17 @@ function App() {
   const [derived, setDerived] = useState<DerivedDesign>(() =>
     deriveDesign(config),
   );
-  const [mode, setMode] = useState<PreviewMode>("assembly");
+  const [mode, setMode] = useState<AppView>("assembly");
+  const is3D = mode === "review-3d";
+  const svgMode: PreviewMode = is3D ? "assembly" : mode;
+  const [reviewSettings, setReviewSettings] = useState<ReviewSettings>(loadReviewSettings);
   const [compressionEnvelope, setCompressionEnvelope] = useState(false);
   const [previewSvg, setPreviewSvg] = useState(() =>
     buildPreviewSvg(
       derived.config,
       derived.geometry,
       derived.pointCodeArtwork,
-      mode,
+      "assembly",
     ),
   );
   const [previewCamera, setPreviewCamera] = useState<PreviewCamera>(FIT_CAMERA);
@@ -343,6 +357,11 @@ function App() {
   }, [config]);
 
   useEffect(() => {
+    try { localStorage.setItem(REVIEW_STORAGE_KEY, JSON.stringify(reviewSettings)); }
+    catch { /* Visual preferences are optional. */ }
+  }, [reviewSettings]);
+
+  useEffect(() => {
     const timer = window.setTimeout(() => {
       try {
         const next = deriveDesign(deferredConfig);
@@ -360,13 +379,14 @@ function App() {
   }, [deferredConfig]);
 
   useEffect(() => {
+    if (is3D) return;
     startTransition(() => {
       setPreviewSvg(
         buildPreviewSvg(
           derived.config,
           derived.geometry,
           derived.pointCodeArtwork,
-          mode,
+          svgMode,
           compressionEnvelope,
         ),
       );
@@ -378,6 +398,7 @@ function App() {
   }, [mode]);
 
   useEffect(() => {
+    if (is3D) return;
     const workspace = previewWorkspaceRef.current;
     if (!workspace) return;
 
@@ -409,7 +430,7 @@ function App() {
 
     workspace.addEventListener("wheel", handleWheel, { passive: false });
     return () => workspace.removeEventListener("wheel", handleWheel);
-  }, []);
+  }, [is3D]);
 
   const fitPreview = () => setPreviewCamera({ ...FIT_CAMERA });
 
@@ -468,11 +489,11 @@ function App() {
     ),
   ];
   const blocking = warnings.some(({ severity }) => severity === "error");
-  const currentPreviewSize = previewSize(derived.geometry, mode);
-  const sealView = mode === "assembly" || mode === "binding";
-  const viewMetadata = { ...VIEW_METADATA[mode],
-    description: sealView && compressionEnvelope ? t("scenarioDescription") : t(VIEW_METADATA[mode].description),
-    legend: VIEW_METADATA[mode].legend.map((item) => ({ ...item,
+  const currentPreviewSize = previewSize(derived.geometry, svgMode);
+  const sealView = mode === "assembly" || mode === "binding" || is3D;
+  const viewMetadata = is3D ? { layer: "User.Review3D", description: t("reviewDescription"), legend: [] } : { ...VIEW_METADATA[svgMode],
+    description: sealView && compressionEnvelope ? t("scenarioDescription") : t(VIEW_METADATA[svgMode].description),
+    legend: VIEW_METADATA[svgMode].legend.map((item) => ({ ...item,
       label: sealView && compressionEnvelope && item.swatch === "black-fill" ? t("scenarioSeal") : t(item.label) })),
   };
 
@@ -482,7 +503,7 @@ function App() {
   const screen6060Asset = assetById(SCREEN_6060_ASSET_ID);
 
   const downloadCurrentView = () => {
-    if (blocking || generationError || pending || exportLock.current) return;
+    if (is3D || blocking || generationError || pending || exportLock.current) return;
     downloadSvgAsset({
       id: `preview-${mode}`,
       filename: `preview-${mode}.svg`,
@@ -598,7 +619,8 @@ function App() {
             </Help>
             <Help content="儲存目前分頁及所選膠體階段的參考 SVG；壓合情境屬預覽。正式製造檔請用 ZIP，Binding 一律使用印刷膠版。">
             <button
-              disabled={outputDisabled}
+              disabled={outputDisabled || is3D}
+              title={is3D ? t("reviewSvgNote") : undefined}
               onClick={downloadCurrentView}
             >
               {t("Save View SVG")}
@@ -955,15 +977,24 @@ function App() {
               </button>
               </Help>
             ))}
+            <Help as="span" content={t("reviewDescription")}>
+              <button className={is3D ? "selected" : ""} type="button" data-view-mode="review-3d"
+                onClick={() => setMode("review-3d")}>{t("reviewTab")}</button>
+            </Help>
             {sealView ? <>
-              <Help as="label" id="seal-stage-help" content="Assembly 與 Binding 共用此選擇：關閉時顯示相同印刷膠版，開啟時顯示相同壓合尺寸情境。情境非實測，製造 ZIP 仍固定輸出印刷膠版。"><input aria-describedby="seal-stage-help" data-testid="seal-stage-toggle" type="checkbox" checked={compressionEnvelope} onChange={(e) => setCompressionEnvelope(e.target.checked)} /> {t("compressionToggle")}</Help>
+              <Help as="label" id="seal-stage-help" content={t("sharedSealHelp")}><input aria-describedby="seal-stage-help" data-testid="seal-stage-toggle" type="checkbox" checked={compressionEnvelope} onChange={(e) => setCompressionEnvelope(e.target.checked)} /> {t("compressionToggle")}</Help>
               <strong data-testid="seal-stage" data-seal-stage={compressionEnvelope ? "compression-scenario" : "printed"}>
                 {compressionEnvelope ? t("sealScenario") : t("sealPrinted")}
               </strong>
             </> : null}
           </nav>
 
-          <div
+          {is3D ? <ReviewBoundary fallback={<div className="review-placeholder" role="alert">{t("reviewUnavailable")}</div>}>
+            <Suspense fallback={<div className="review-placeholder" role="status">{t("reviewLoading")}</div>}>
+              <Review3D config={derived.config} geometry={derived.geometry} compressionEnvelope={compressionEnvelope}
+                settings={reviewSettings} onChange={setReviewSettings} />
+            </Suspense>
+          </ReviewBoundary> : <div
             ref={previewWorkspaceRef}
             className={`preview-workspace ${isPanning ? "panning" : ""}`}
             aria-label={t("panZoom")}
@@ -1007,9 +1038,10 @@ function App() {
               </div>
               <small>{t("cameraHelp")}</small>
             </div>
-          </div>
+          </div>}
 
           <div className="preview-info">
+            {is3D ? <span>{t("reviewFooter")}</span> : <>
             {mode === "assembly" ? <div className="assembly-contact-readout" data-testid="assembly-contacts">
               <strong>{t("zebraContacts")}<br /><small>{t("exposedFto")}</small></strong>
               {zebraContacts.map((region) => <Help key={region.polarity} tabIndex={0} className="contact-readout"
@@ -1051,6 +1083,7 @@ function App() {
                 </span>
               ))}
             </div>
+            </>}
           </div>
         </section>
       </main>
