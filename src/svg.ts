@@ -9,8 +9,9 @@ import {
   type PointCodeArtwork,
   type PreviewMode,
   type Rect,
+  type PolygonSet,
 } from "./model";
-import { insetConvexPolygon } from "./point-code";
+import { zebraContactRegions } from "./contacts";
 
 export interface SvgAsset {
   id: string;
@@ -44,7 +45,6 @@ const BLACK = "#000000";
 const WHITE = "#ffffff";
 const ASSEMBLY_TIO2 = "#d5d5d5";
 const ASSEMBLY_PT = "#707070";
-const GUIDE_STROKE = "#888888";
 const DRAFTING_LINE_WIDTH_MM = 0.06;
 
 export const CIRCUIT_PANEL_GAP_MM = 8;
@@ -103,17 +103,8 @@ function linePath(points: Point[], map: CoordinateMap): string {
     .join(" ");
 }
 
-function rectPoints(rect: Rect): Point[] {
-  return [
-    { x: rect.x, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height },
-    { x: rect.x, y: rect.y + rect.height },
-  ];
-}
-
-function rectPath(rect: Rect, map: CoordinateMap): string {
-  return ringPath(rectPoints(rect), map);
+function polygonSetPaths(polygons: PolygonSet, map: CoordinateMap): string {
+  return polygons.map((p, i) => `<path data-polygon-index="${i}" d="${p.map((r) => ringPath(r, map)).join(" ")}" fill-rule="evenodd"/>`).join("\n");
 }
 
 function mappedRect(rect: Rect, map: CoordinateMap): Rect {
@@ -251,9 +242,9 @@ function selectedScreenRegions(
   geometry: LayoutGeometry,
   plate: PlateId,
 ): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[] }> {
-  const insetMm = finiteNonnegative(config.bindingWidthMm) / 2;
+  void config;
   return selectedScreenCells(geometry, plate).flatMap((cell) => {
-    const polygon = insetConvexPolygon(cell.polygon, insetMm);
+    const polygon = geometry.fabrication.activeRegions[cell.index];
     return polygon.length >= 3 ? [{ cell, polygon }] : [];
   });
 }
@@ -341,21 +332,45 @@ function buildScreenSvg(
   });
 }
 
-function buildAssemblyPreview(geometry: LayoutGeometry): string {
+function assemblyContactGuides(geometry: LayoutGeometry, map: CoordinateMap): string {
+  return [
+    '<g id="GUIDES_NON_PRINTING" data-output="non-printing">',
+    '<defs><pattern id="ASSEMBLY_ZEBRA_HATCH" patternUnits="userSpaceOnUse" width="1" height="1"><rect width="1" height="1" fill="#f4f4f4"/><path d="M -0.25 0.25 L 0.25 -0.25 M 0 1 L 1 0 M 0.75 1.25 L 1.25 0.75" stroke="#777777" stroke-width="0.08" fill="none"/></pattern></defs>',
+    '<g id="ASSEMBLY_ZEBRA_CONTACTS" data-operation="exposed-fto-contact-reference">',
+    ...zebraContactRegions(geometry).filter((region) => region.areaMm2 > 0).map((region) => {
+      const strip = mappedRect(region.strip, map);
+      const cx = strip.x + strip.width / 2, cy = strip.y + strip.height / 2;
+      const fontSize = Math.min(2, strip.width * 0.65, strip.height * 0.05);
+      const symbol = region.polarity === "negative" ? "−" : "+";
+      return [
+        `<g id="ASSEMBLY_ZEBRA_${region.polarity.toUpperCase()}" data-polarity="${region.polarity}" data-plate="${region.plate}" data-cell-number="${region.cellNumber}" data-connected="${region.connected}" data-strip-x="${number(strip.x)}" data-strip-y="${number(strip.y)}" data-strip-width-mm="${number(strip.width)}" data-strip-height-mm="${number(strip.height)}" data-area-mm2="${number(region.areaMm2)}">`,
+        `<title>${symbol} zebra contact · exposed bigger-electrode FTO · ${number(region.areaMm2)} mm²${region.connected && region.continuous ? "" : " · OPEN / invalid layout"}</title>`,
+        `<g fill="url(#ASSEMBLY_ZEBRA_HATCH)">${polygonSetPaths(region.polygons, map)}</g>`,
+        `<text x="${number(cx)}" y="${number(cy)}" transform="rotate(-90 ${number(cx)} ${number(cy)})" font-size="${number(fontSize)}" font-family="sans-serif" font-weight="bold" text-anchor="middle" dominant-baseline="middle" fill="${BLACK}" stroke="${WHITE}" stroke-width="0.4" paint-order="stroke">${symbol} ZEBRA</text>`,
+        '</g>',
+      ].join("\n");
+    }),
+    '</g></g>',
+  ].join("\n");
+}
+
+function buildAssemblyPreview(geometry: LayoutGeometry, envelope = false): string {
   const map = assemblyMap(geometry);
   const cells = geometry.cells
     .map((cell) => {
       const material = cell.glass6066Material;
       const fill = material === "tio2" ? ASSEMBLY_TIO2 : ASSEMBLY_PT;
-      return `<path data-region-id="assembly-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" d="${ringPath(cell.polygon, map)}" fill="${fill}"/>`;
+      return `<path data-region-id="assembly-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" d="${ringPath(geometry.fabrication.activeRegions[cell.index], map)}" fill="${fill}"/>`;
     })
     .join("\n");
   const body = [
     `<rect id="ASSEMBLY_GLASS" x="0" y="0" width="${number(geometry.glass6066.width)}" height="${number(geometry.glass6066.height)}" fill="${WHITE}"/>`,
     `<g id="ASSEMBLY_CIRCUIT_MATERIAL_CELLS">${cells}</g>`,
+    `<g id="ASSEMBLY_SEAL" data-seal-stage="${envelope ? "compression-scenario" : "printed"}" fill="${BLACK}">${polygonSetPaths(envelope ? geometry.fabrication.sealAssembled : geometry.fabrication.sealPrint, map)}</g>`,
+    assemblyContactGuides(geometry, map),
   ].join("\n");
   return documentSvg({
-    title: "Final assembled appearance",
+    title: envelope ? "Assembly reference — compression scenario, not measured" : "Assembly reference — printed AB-313 layout",
     view: "assembly",
     plate: "assembly",
     widthMm: geometry.glass6066.width,
@@ -364,8 +379,10 @@ function buildAssemblyPreview(geometry: LayoutGeometry): string {
     outputKind: "preview",
     body,
     metadata: {
-      interpretation: "final appearance only",
+      interpretation: envelope ? "compression scenario; not a measured assembled sample" : "coating reference with the same printed adhesive geometry as the Binding mask",
       materialBasis: "glass-6066",
+      sealStage: envelope ? "compression-scenario" : "printed",
+      zebraContacts: "hatched exposed retained FTO on bigger electrode; non-printing reference, not adhesive / etch artwork",
     },
   });
 }
@@ -405,7 +422,7 @@ function renderCircuitContacts(
       const strip = mappedRect(terminal.contactStrip, map);
       const symbol = terminal.polarity === "negative" ? "-" : "+";
       return [
-        `<rect data-region-id="circuit-6066-${terminal.polarity}-contact-strip" data-polarity="${terminal.polarity}" x="${number(strip.x)}" y="${number(strip.y)}" width="${number(strip.width)}" height="${number(strip.height)}" fill="#bcbcbc" stroke="${BLACK}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}"/>`,
+        `<rect data-region-id="circuit-6066-${terminal.polarity}-contact-strip" data-polarity="${terminal.polarity}" x="${number(strip.x)}" y="${number(strip.y)}" width="${number(strip.width)}" height="${number(strip.height)}" fill="#bcbcbc"/>`,
         `<text data-polarity="${terminal.polarity}" x="${number(strip.x + strip.width / 2)}" y="${number(strip.y + strip.height / 2)}" fill="${BLACK}" stroke="none" font-size="2.8" text-anchor="middle" dominant-baseline="middle">${symbol}</text>`,
       ].join("\n");
     })
@@ -426,7 +443,7 @@ function renderCircuitPanel(
       const material = materialForPlate(cell, plate);
       const fill =
         material === "tio2" ? "#d5d5d5" : `url(#${circuitPatternId(plate)})`;
-      return `<path data-region-id="circuit-${suffix}-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" data-electron-order="${cell.index + 1}" d="${ringPath(cell.polygon, map)}" fill="${fill}" stroke="${BLACK}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}" stroke-linejoin="round"/>`;
+      return `<path data-region-id="circuit-${suffix}-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" data-electron-order="${cell.index + 1}" d="${ringPath(geometry.fabrication.activeRegions[cell.index], map)}" fill="${fill}"/>`;
     })
     .join("\n");
   const routePoints =
@@ -441,7 +458,7 @@ function renderCircuitPanel(
     .join("\n");
   return [
     `<g id="CIRCUIT_PLATE_${suffix}" data-plate="${plate}" data-mirrored="${plate === "glass-6060" && config.mirrorGlass6060 ? "true" : "false"}">`,
-    `<rect id="CIRCUIT_${suffix}_PLATE_OUTLINE" x="${number(origin.x)}" y="${number(origin.y)}" width="${number(rect.width)}" height="${number(rect.height)}" fill="${WHITE}" stroke="${BLACK}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}"/>`,
+    `<rect id="CIRCUIT_${suffix}_PLATE_OUTLINE" x="${number(origin.x)}" y="${number(origin.y)}" width="${number(rect.width)}" height="${number(rect.height)}" fill="${WHITE}"/>`,
     plate === "glass-6066"
       ? `<g id="CIRCUIT_6066_CONTACT_STRIPS">${renderCircuitContacts(geometry, map)}</g>`
       : "",
@@ -487,10 +504,14 @@ function etchSourceAttributes(path: EtchPath): string {
   switch (path.source) {
     case "electrode-voronoi":
       return `data-boundary-index="${path.boundaryIndex ?? -1}" data-cells="${path.cells?.join(",") ?? ""}"`;
+    case "voronoi-bleed":
+      return `data-boundary-index="${path.boundaryIndex ?? -1}" data-cells="${path.cells?.join(",") ?? ""}" data-piece-index="${path.pieceIndex}" data-glass-edge="${path.glassEdge}"${path.sharedSide ? ` data-shared-side="${path.sharedSide}"` : ""}`;
     case "active-perimeter":
       return `data-perimeter-index="${path.perimeterIndex ?? -1}" data-piece-index="${path.pieceIndex ?? -1}"`;
     case "terminal-isolation":
       return `data-isolation-index="${path.isolationIndex ?? -1}"`;
+    case "contact-strip-isolation":
+      return `data-polarity="${path.polarity}" data-piece-index="${path.pieceIndex ?? -1}"`;
   }
 }
 
@@ -505,61 +526,6 @@ function renderEtchOperative(
       (path, pathIndex) =>
         `<path data-region-id="etch-${suffix}-${path.source}-${pathIndex}" data-path-index="${pathIndex}" data-source="${path.source}" data-plate="${path.plate}" ${etchSourceAttributes(path)} d="${linePath([path.start, path.end], map)}"/>`,
     )
-    .join("\n");
-}
-
-function terminalCorridorPath(
-  terminal: LayoutGeometry["terminals"][number],
-  map: CoordinateMap,
-): string {
-  const stripEdgeX =
-    terminal.gate.side === "left"
-      ? terminal.contactStrip.x + terminal.contactStrip.width
-      : terminal.contactStrip.x;
-  return ringPath(
-    [
-      { x: stripEdgeX, y: terminal.gate.start.y },
-      terminal.gate.start,
-      terminal.gate.end,
-      { x: stripEdgeX, y: terminal.gate.end.y },
-    ],
-    map,
-  );
-}
-
-function renderEndpointCellGuides(
-  geometry: LayoutGeometry,
-  plate: PlateId,
-  map: CoordinateMap,
-): string {
-  const suffix = plate === "glass-6066" ? "6066" : "6060";
-  const endpointIndexes = Array.from(
-    new Set([0, geometry.cells.length - 1].filter((index) => index >= 0)),
-  );
-  return endpointIndexes
-    .flatMap((cellIndex) => {
-      const cell = geometry.cells[cellIndex];
-      if (!cell) return [];
-      return [
-        `<path data-region-id="etch-${suffix}-endpoint-cell-${cell.index}" data-subcell-index="${cell.index}" d="${ringPath(cell.polygon, map)}"/>`,
-      ];
-    })
-    .join("\n");
-}
-
-function renderTerminalConnectivityGuides(
-  geometry: LayoutGeometry,
-  map: CoordinateMap,
-): string {
-  return geometry.terminals
-    .map((terminal) => {
-      const strip = mappedRect(terminal.contactStrip, map);
-      return [
-        `<rect data-region-id="etch-6066-${terminal.polarity}-strip-guide" data-polarity="${terminal.polarity}" x="${number(strip.x)}" y="${number(strip.y)}" width="${number(strip.width)}" height="${number(strip.height)}" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}"/>`,
-        `<path data-region-id="etch-6066-${terminal.polarity}-corridor-guide" data-polarity="${terminal.polarity}" d="${terminalCorridorPath(terminal, map)}" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}" stroke-linejoin="round"/>`,
-        `<path data-region-id="etch-6066-${terminal.polarity}-gate-guide" data-polarity="${terminal.polarity}" data-cell-index="${terminal.cellIndex}" d="${linePath([terminal.gate.start, terminal.gate.end], map)}" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}"/>`,
-      ].join("\n");
-    })
     .join("\n");
 }
 
@@ -584,35 +550,20 @@ function renderEndpointLabels(
     .join("\n");
 }
 
-function renderIsolationGuides(
-  geometry: LayoutGeometry,
-  plate: PlateId,
-  map: CoordinateMap,
-): string {
-  return geometry.etchPaths[plate]
-    .filter((path) => path.source === "terminal-isolation")
-    .map(
-      (path) =>
-        `<path data-source="terminal-isolation" data-isolation-index="${path.isolationIndex ?? -1}" d="${linePath([path.start, path.end], map)}"/>`,
-    )
-    .join("\n");
-}
-
 function renderEtchGuides(
   geometry: LayoutGeometry,
   plate: PlateId,
   map: CoordinateMap,
 ): string {
-  const rect = plateRect(geometry, plate);
   const suffix = plate === "glass-6066" ? "6066" : "6060";
   return [
     `<g id="GUIDES_NON_PRINTING" data-output="non-printing">`,
-    `<rect id="ETCH_${suffix}_PLATE_OUTLINE_GUIDE" x="0" y="0" width="${number(rect.width)}" height="${number(rect.height)}" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}"/>`,
-    `<g id="ETCH_${suffix}_ENDPOINT_CELLS_GUIDE" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}" stroke-linejoin="round">${renderEndpointCellGuides(geometry, plate, map)}</g>`,
     plate === "glass-6066"
-      ? `<g id="ETCH_6066_TERMINAL_CONNECTIVITY_GUIDE">${renderTerminalConnectivityGuides(geometry, map)}</g>`
+      ? `<g id="ETCH_6066_CONTACT_LABELS">${geometry.terminals.map((t) => {
+          const p = map({ x: t.contactStrip.x + t.contactStrip.width / 2, y: t.contactStrip.y + t.contactStrip.height / 2 });
+          return `<text x="${number(p.x)}" y="${number(p.y)}" fill="${BLACK}" font-size="1.8" text-anchor="middle">${t.polarity === "negative" ? "−" : "+"}</text>`;
+        }).join("\n")}</g>`
       : "",
-    `<g id="ETCH_${suffix}_ISOLATION_CUTS_GUIDE" fill="none" stroke="${GUIDE_STROKE}" stroke-width="${number(DRAFTING_LINE_WIDTH_MM)}">${renderIsolationGuides(geometry, plate, map)}</g>`,
     `<g id="ETCH_${suffix}_ENDPOINT_LABELS">${renderEndpointLabels(geometry, plate, map)}</g>`,
     "</g>",
   ]
@@ -656,6 +607,10 @@ function buildEtchSvg(
       terminalIsolationPathCount: paths.filter(
         ({ source }) => source === "terminal-isolation",
       ).length,
+      contactStripIsolationPathCount: paths.filter(({ source }) => source === "contact-strip-isolation").length,
+      fullHeightIsolationRouteCount: geometry.fabrication.isolationRoutes[plate].filter((r) => r.continuousTopToBottom).length,
+      voronoiBleedCount: geometry.fabrication.bleedCheck[plate].count,
+      perimeterEtch: false,
     },
   });
 }
@@ -663,35 +618,34 @@ function buildEtchSvg(
 function buildBindingSvg(
   config: DesignConfig,
   geometry: LayoutGeometry,
+  envelope = false,
 ): string {
   const map = assemblyMap(geometry);
-  const active = mappedRect(geometry.bindingInner, map);
-  const ring = `${rectPath(geometry.bindingOuter, map)} ${rectPath(geometry.bindingInner, map)}`;
-  const boundaries = geometry.boundaries
-    .map(
-      (boundary, index) =>
-        `<path data-region-id="binding-intercell-${index}" data-boundary-index="${index}" data-cells="${boundary.cells.join(",")}" d="${linePath([boundary.start, boundary.end], map)}"/>`,
-    )
-    .join("\n");
   const bindingWidth = finiteNonnegative(config.bindingWidthMm);
   const body = [
     `<rect id="BINDING_PAGE" x="0" y="0" width="${number(geometry.glass6066.width)}" height="${number(geometry.glass6066.height)}" fill="${WHITE}"/>`,
-    `<defs><clipPath id="BINDING_ACTIVE_CLIP" clipPathUnits="userSpaceOnUse"><rect x="${number(active.x)}" y="${number(active.y)}" width="${number(active.width)}" height="${number(active.height)}"/></clipPath></defs>`,
-    `<g id="BINDING_MASK" data-operation="bonding-mask" fill="${BLACK}">`,
-    `<path data-region-id="binding-outer-ring" d="${ring}" fill-rule="evenodd" clip-rule="evenodd"/>`,
-    `<g fill="none" stroke="${BLACK}" stroke-width="${number(bindingWidth)}" stroke-linecap="round" stroke-linejoin="round" clip-path="url(#BINDING_ACTIVE_CLIP)">${boundaries}</g>`,
+    `<g id="BINDING_MASK" data-seal-stage="${envelope ? "compression-scenario" : "printed"}" data-operation="${envelope ? "compression-scenario" : "bonding-mask"}" fill="${BLACK}">`,
+    polygonSetPaths(envelope ? geometry.fabrication.sealAssembled : geometry.fabrication.sealPrint, map),
     "</g>",
   ].join("\n");
   return documentSvg({
-    title: "Binding mask",
+    title: envelope ? "AB-313 compression envelope — assumption-based preview, NOT a stencil" : "AB-313 printed mask",
     view: "binding",
     plate: "none",
     widthMm: geometry.glass6066.width,
     heightMm: geometry.glass6066.height,
     mirrored: false,
-    outputKind: "production",
+    outputKind: envelope ? "preview" : "production",
     body,
-    metadata: { nominalBindingWidthMm: bindingWidth },
+    metadata: { nominalBindingWidthMm: bindingWidth, fillPortCount: geometry.fabrication.ports.length,
+      minimumPrintedOpeningMm: geometry.fabrication.minimumPrintedChannelMm,
+      minimumScenarioOpeningMm: geometry.fabrication.minimumChannelMm,
+      sizingFilmUm: geometry.fabrication.openingScenario.filmUm,
+      sizingSource: geometry.fabrication.openingScenario.source,
+      pressedOpeningMeasured: false,
+      sealStage: envelope ? "compression-scenario" : "printed",
+      compressionValid: geometry.fabrication.compressionValid,
+      interpretation: envelope ? "Aperture-sizing scenario, not a measured pressed result or production stencil" : "Black = printed AB-313; width is in mm, without plate-registration inflation" },
   });
 }
 
@@ -700,10 +654,11 @@ export function buildPreviewSvg(
   geometry: LayoutGeometry,
   pointCodeArtwork: PointCodeArtwork,
   mode: PreviewMode,
+  compressionEnvelope = false,
 ): string {
   switch (mode) {
     case "assembly":
-      return buildAssemblyPreview(geometry);
+      return buildAssemblyPreview(geometry, compressionEnvelope);
     case "circuit":
       return buildCircuitReference(config, geometry);
     case "glass-6066":
@@ -715,7 +670,7 @@ export function buildPreviewSvg(
     case "etch-6060":
       return buildEtchSvg(config, geometry, "glass-6060");
     case "binding":
-      return buildBindingSvg(config, geometry);
+      return buildBindingSvg(config, geometry, compressionEnvelope);
     default:
       throw new Error(`Unsupported preview mode: ${String(mode)}`);
   }
@@ -758,7 +713,7 @@ export function buildFabricationAssets(
     asset(
       "assembly-preview",
       "assembly-preview.svg",
-      "Final assembled appearance",
+      "Assembly reference — printed AB-313 layout",
       geometry.glass6066.width,
       geometry.glass6066.height,
       buildAssemblyPreview(geometry),

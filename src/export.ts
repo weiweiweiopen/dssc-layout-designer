@@ -2,7 +2,9 @@ import {
   DEFAULT_BITMAP_DPI,
   svgAssetToBilevelTiffBlob,
 } from "./bitmap";
-import { insetConvexPolygon } from "./point-code";
+import { laserFillExport, laserFillSvg } from "./laser";
+import { electricalEstimate, sealProcess } from "./process";
+import { zebraContactRegions } from "./contacts";
 import {
   POINT_CODE_MIN_GAP_MM,
   POINT_CODE_RADIUS_MM,
@@ -187,15 +189,6 @@ function openRing(points: Point[]): Point[] {
   return points;
 }
 
-function rectPoints(rect: Rect): Point[] {
-  return [
-    { x: rect.x, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height },
-    { x: rect.x, y: rect.y + rect.height },
-  ];
-}
-
 function appendClosedPolyline(
   output: string[],
   layer: string,
@@ -290,9 +283,7 @@ function selectedScreenRegions(
   geometry: LayoutGeometry,
   plate: PlateId,
 ): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[] }> {
-  const bindingWidth = Number.isFinite(config.bindingWidthMm)
-    ? Math.max(0, config.bindingWidthMm)
-    : 0;
+  void config;
   return geometry.cells.flatMap((cell) => {
     const isTio2 =
       plate === "glass-6066"
@@ -300,7 +291,7 @@ function selectedScreenRegions(
         : cell.glass6060Material === "tio2";
     if (!isTio2) return [];
 
-    const polygon = insetConvexPolygon(cell.polygon, bindingWidth / 2);
+    const polygon = geometry.fabrication.activeRegions[cell.index];
     return polygon.length >= 3 ? [{ cell, polygon }] : [];
   });
 }
@@ -310,10 +301,14 @@ function dxfEtchPathComment(path: EtchPath, pathIndex: number): string {
     switch (path.source) {
       case "electrode-voronoi":
         return `boundaryIndex=${String(path.boundaryIndex)} cells=${path.cells?.join(",") ?? ""}`;
+      case "voronoi-bleed":
+        return `boundaryIndex=${path.boundaryIndex} cells=${path.cells?.join(",")} pieceIndex=${path.pieceIndex} glassEdge=${path.glassEdge}${path.sharedSide ? ` sharedSide=${path.sharedSide}` : ""}`;
       case "active-perimeter":
         return `perimeterIndex=${String(path.perimeterIndex)} pieceIndex=${String(path.pieceIndex)}`;
       case "terminal-isolation":
         return `isolationIndex=${String(path.isolationIndex)}`;
+      case "contact-strip-isolation":
+        return `polarity=${path.polarity} pieceIndex=${String(path.pieceIndex)}`;
     }
   })();
   return `geometry.etchPaths[${path.plate}][${pathIndex}] source=${path.source} ${metadata}`;
@@ -377,7 +372,7 @@ export function buildManufacturingDxf(
   appendDxfPair(
     output,
     999,
-    "Screen region layers are the black TiO2 operations derived from each plate's circuit materials and inset by bindingWidthMm/2.",
+    "Screen region layers are actual TiO2 coating operations after seal-envelope, registration and etch clearance; coating trim is not extra adhesive.",
   );
   appendDxfPair(
     output,
@@ -397,7 +392,7 @@ export function buildManufacturingDxf(
   appendDxfPair(
     output,
     999,
-    `BINDING contains bindingOuter, bindingInner, and every inter-cell boundary centerline; nominal bindingWidthMm=${String(config.bindingWidthMm)}.`,
+    `BINDING contains opened SOLID HATCH stencil polygons; printed normal wall width bindingWidthMm=${String(config.bindingWidthMm)} mm; not compression-envelope artwork.`,
   );
 
   const map6066 = plateMap(config, geometry, "glass-6066");
@@ -468,35 +463,22 @@ export function buildManufacturingDxf(
       referenceMap,
     );
   }
-  for (const perimeter of geometry.activePerimeter) {
-    appendLine(
-      output,
-      "CIRCUIT_REFERENCE",
-      perimeter.start,
-      perimeter.end,
-      referenceMap,
-    );
-  }
-  appendClosedPolyline(
-    output,
-    "BINDING",
-    rectPoints(geometry.bindingOuter),
-    referenceMap,
-  );
-  appendClosedPolyline(
-    output,
-    "BINDING",
-    rectPoints(geometry.bindingInner),
-    referenceMap,
-  );
-  for (const boundary of geometry.boundaries) {
-    appendLine(
-      output,
-      "BINDING",
-      boundary.start,
-      boundary.end,
-      referenceMap,
-    );
+  // SOLID HATCH with explicit hole loops: same opened glue polygons as SVG/PDF.
+  for (const polygon of geometry.fabrication.sealPrint) {
+    appendDxfPair(output, 0, "HATCH");
+    appendDxfPair(output, 100, "AcDbEntity");
+    appendDxfPair(output, 8, "BINDING");
+    appendDxfPair(output, 100, "AcDbHatch");
+    for (const [code, value] of [[10, 0], [20, 0], [30, 0], [210, 0], [220, 0], [230, 1], [2, "SOLID"], [70, 1], [71, 0], [91, polygon.length]] as const) appendDxfPair(output, code, value);
+    polygon.forEach((ring, index) => {
+      const points = openRing(ring);
+      for (const [code, value] of [[92, index === 0 ? 3 : 2], [72, 0], [73, 1], [93, points.length]] as const) appendDxfPair(output, code, value);
+      points.forEach((p) => { const v = referenceMap(p); appendDxfPair(output, 10, dxfNumber(v.x)); appendDxfPair(output, 20, dxfNumber(v.y)); });
+      appendDxfPair(output, 97, 0);
+    });
+    appendDxfPair(output, 75, 0);
+    appendDxfPair(output, 76, 1);
+    appendDxfPair(output, 98, 0);
   }
 
   appendDxfPair(output, 0, "ENDSEC");
@@ -524,6 +506,9 @@ function galvoSourceMetadata(path: EtchPath): Record<string, unknown> {
         boundaryIndex: path.boundaryIndex,
         cells: path.cells,
       };
+    case "voronoi-bleed":
+      return { boundaryIndex: path.boundaryIndex, cells: path.cells, pieceIndex: path.pieceIndex, glassEdge: path.glassEdge,
+        ...(path.sharedSide ? { sharedSide: path.sharedSide } : {}) };
     case "active-perimeter":
       return {
         perimeterIndex: path.perimeterIndex,
@@ -531,6 +516,8 @@ function galvoSourceMetadata(path: EtchPath): Record<string, unknown> {
       };
     case "terminal-isolation":
       return { isolationIndex: path.isolationIndex };
+    case "contact-strip-isolation":
+      return { polarity: path.polarity, pieceIndex: path.pieceIndex };
   }
 }
 
@@ -583,15 +570,19 @@ export function buildGalvoToolpaths(
         ...galvoSourceMetadata(path),
         points: [point(path.start), point(path.end)],
       })),
+      isolationRoutes: geometry.fabrication.isolationRoutes[plate].map((route) => ({
+        side: route.side, points: route.points.map(point), pathIndices: route.pathIndices,
+        continuousTopToBottom: route.continuousTopToBottom, referenceOnly: true,
+      })),
     };
   };
 
   return `${JSON.stringify(
     {
-      format: "w-series-dssc-galvo-toolpath-v3",
+      format: "w-series-dssc-galvo-toolpath-v4",
       units: "mm",
       description:
-        "Neutral interchange for the canonical per-plate FTO etch centerlines, including electrode-voronoi, active-perimeter, and top/bottom terminal-isolation paths; not a device wire protocol.",
+        "Unframed Voronoi FTO centerlines: electrode-voronoi core cuts plus voronoi-bleed extensions to physical glass edges. No active-perimeter / rectangular etch frame. 6066 side bleed protects zebra contact faces. isolationRoutes are reference-only existing cuts. Not a device wire protocol.",
       interchange: {
         neutral: true,
         deviceWireProtocol: false,
@@ -764,33 +755,59 @@ export async function downloadScreenTiff(asset: SvgAsset): Promise<void> {
 
 function readme(config: DesignConfig): string {
   return [
-    "W 型串聯 DSSC 製造輸出 v4",
+    "W 型串聯 DSSC 製造輸出 v9.1 — uniform coating clearance / no centroid trimming",
     "",
     "所有製造尺寸與座標均以毫米（mm）表示。",
-    "兩片網版的黑色區域是由串聯電路材料配置直接決定的各片頂層 TiO2 region mask，並由每個 cell 邊界向內縮 bindingWidthMm/2。",
-    `白色圓形是 Demaine-site point knockout（不印刷），固定半徑 ${String(POINT_CODE_RADIUS_MM)} mm、直徑 ${(POINT_CODE_RADIUS_MM * 2).toFixed(2)} mm；同一 point-code placement 內任兩 site 的最小圓心間距為 ${(POINT_CODE_RADIUS_MM * 2 + POINT_CODE_MIN_GAP_MM).toFixed(2)} mm，也就是圓直徑加上 ${POINT_CODE_MIN_GAP_MM.toFixed(2)} mm 最小邊緣間隙。它們是點位編碼，不是可閱讀字樣，也不是文字負片。`,
-    `Point knockout geometry: radius ${String(POINT_CODE_RADIUS_MM)} mm, diameter ${(POINT_CODE_RADIUS_MM * 2).toFixed(2)} mm; within each point-code placement, minimum site center-to-center spacing is ${(POINT_CODE_RADIUS_MM * 2 + POINT_CODE_MIN_GAP_MM).toFixed(2)} mm, leaving a ${POINT_CODE_MIN_GAP_MM.toFixed(2)} mm edge-to-edge gap.`,
-    "若 canonical bindingWidthMm/2 inset 少於三個頂點，SVG 與 DXF 都會省略該 TiO2 region 及其 point knockout；validatePointCodeArtwork 會回報 blocking error，必須修正設計後再製造。",
-    "FTO 電極蝕刻層與 point knockout 彼此獨立；point site 不作為 FTO 蝕刻線，也不會進入 Galvo 路徑。",
-    "兩片 screen SVG 已是乾淨的黑白二值 TiO2 分色；黑色為 TiO2 操作區，白色為不印刷頁面或 point knockout。製造 PDF 直接使用相同二值 SVG。",
+    "TiO2 網版的黑色為 active region，已扣除 Binding、估計膠體擴散、對位與 FTO 切寬；白色不印刷。",
+    "Area Balance只約束移動Voronoi sites以改善分區面積，不再按比例裁小塗層。每個cell以相同法向安全距離內縮，填滿固定分區可用凸形範圍；局部搜尋不保證精確等面積或全域最佳。",
+    "Coating Safety Gap是壓合設計情境中的最小淨距離目標，另加對位餘量與情境膠體成長量得到印刷膠邊退讓；較大蝕刻寬度可能主導。預設0.10mm是未驗證設計起點，非材料安全規格。",
+    "Point Code Text 已從 v5 介面移除，v5 新設計文字為空。",
     `bitmap-production/ 內的兩片網版為未壓縮、真正 1-bit、${DEFAULT_BITMAP_DPI} DPI TIFF（uncompressed true 1-bit ${DEFAULT_BITMAP_DPI} DPI TIFF）；檔名以 -1bit-${DEFAULT_BITMAP_DPI}dpi.tif 結尾。`,
     `6060 玻璃製造檔水平鏡射：${config.mirrorGlass6060 ? "是" : "否"}。復原該製造鏡射並加回玻璃局部座標位移後，兩片網版會在組裝座標重合。`,
     "6066 左右 zebra 外露接觸條涵蓋玻璃完整高度；端點 cell gate 使用端點子電池在 facing side 擁有的完整跨度，不是縮短的 bridge。",
     "Terminal geometry: full-height 6066 zebra strips and full cell gates across each endpoint cell's owned facing-side span.",
-    "兩片玻璃都包含頂部與底部各一條 terminal-isolation 切線（每片恰好兩條），用來隔離延伸至端子區的 FTO。",
-    "Both plates include top/bottom terminal-isolation cuts.",
+    "FTO只包含electrode-voronoi與voronoi-bleed：選中的Voronoi邊界在生成區邊緣直接出血到實際玻璃邊，完全不生成active-perimeter、矩形蝕刻框、獨立fence或四角stub。",
+    "6060依邊界方向出血；6066每側同方向的端點共用一條直線，其他Voronoi邊以T接點相接，取消平行扇形出血與重複掃描；保留完整zebra接觸面。每段出血都接在選定的Voronoi端點，並非外框。",
+    "Galvo isolationRoutes是現有切線的可追蹤參考路徑，不是要重複曝光的額外操作。白色SVG頁面就是實際玻璃範圍，沒有額外artboard邊框。",
     "每片的 geometry.etchPaths 是唯一 canonical FTO 路徑來源；SVG、DXF 與 Galvo 必須保持相同順序、端點及 source metadata。",
-    `binding-mask 使用 bindingOuter、bindingInner 與全部 inter-cell geometry；名義 bindingWidthMm = ${String(config.bindingWidthMm)} mm。`,
+    `binding-mask 使用已扣除垂直注液／排氣槽的實體多邊形；名義 bindingWidthMm = ${String(config.bindingWidthMm)} mm。`,
+    "DXF BINDING 是帶孔 SOLID HATCH，與 binding-mask.svg 的實體封膠相同。",
+    "注液網路從上到下覆蓋所有子電池，刪除任何一個槽都會失去完整上下通路；不是流體止回閥，不能消除長期離子遷移。",
+    "封膠模型：p=25.4/mesh；a=p-wire；f=(a/p)^2；td=transfer*(2*wire*f+EOM)；h=beadD50。",
+    "開口模型：在實際膠版求 Area(offset(print,s))*h=Area(print)*td；再加使用者側向溢膠及製版邊緣誤差餘量。通道剩餘淨寬由膠體膨脹後的幾何實測，不是直接指定。",
+    "EOM=Emulsion Over Mesh，來自網版製程，不是 AB-313 TDS。預設10µm和轉移率0.32皆為未量測假設。TDS 200µm 是膠層測試厚度，不是 EOM。非零 measuredWetFilmUm 覆寫網版體積估算。",
+    "開口尺寸使用實測濕膜；未量測時改用單次網版滿載幾何估算(transfer=1)的壓合情境，不以未量測0.32當成確定厚度。這不是已驗證最壞上界。minimumArtworkOpeningMm可設定製版孔寬下限。",
+    "printedWidthMm是實際印刷多邊形開口；finalWidthMm/minimumChannelMm是設計情境包絡的幾何淨寬，不是實測成品孔寬。實際壓合後仍未量測。",
+    "Binding與Assembly預設共用sealPrint印刷膠版，預覽可同步切換sealAssembled壓合情境。膠以黑色標示，白色是未塗層／無膠留空。製造檔與assembly-preview參考檔固定使用印刷膠版，不受情境開關影響。",
+    "濕膜小於假設玻璃間隙時壓合預測不成立，不能視為零擴散。壓力／黏度只作流動時間尺度診斷，不能截去多餘膠量。",
+    "玻璃珠商品對照1000目≈15µm連動D50與假設gap；不是通用篩網換算，也不是印刷網版mesh。",
+    "AB-313 TDS 20180206 V.1 p1: viscosity 38000 ± 8000 mPa.s at 25°C；其餘模型係數及 D90 須實測校正。沒有唯一可由黏度求得的最佳孔寬。",
     `design.json 保留實際 electrodeJitter = ${String(config.electrodeJitter)}（允許上限 2）與 ftoEtchWidthMm = ${String(config.ftoEtchWidthMm)} mm（預設 0.08 mm）。`,
     "",
-    "design.json：v4 設計參數、binding、端子、canonical etchPaths 與 pointCodeArtwork。",
+    "design.json：v9 設計參數，以glassHeightMm作兩片共同高度，僅寬度不同；舊高度欄位匯入時遷移，不再匯出。geometry保留端子、canonical etchPaths與fabrication activeRegions／sealPrint／sealAssembled／ports／retainedFto／openingScenario。activePerimeter不可用作蝕刻操作。",
+    "zebraContactReference／process-estimates.zebraContacts：大片左右外露區與保留FTO的實際交集、可接觸面積與導通狀態。Assembly斜線及±標號屬GUIDES_NON_PRINTING參考，不是塗層／膠／蝕刻圖樣。",
+    "process-estimates.json：製程中間值、逐 cell 面積、電流基準、雙片 FTO 等效串聯電阻、未擬合 I–V／MPP 情境及來源。",
+    "electrical.iscMa 是面積縮放的最弱 cell 基準，不是成品輸出。reference-cell 模式以整片對照 Isc／有效面積／照度換算；面積未知時為 null，絕不回退舊 Jsc。",
+    "使用者確認參考有效面積55×55=3025 mm²、通常電流38–40 mA；預設同於此電流參考的光照，以min(Ai)/3025縮放，range不是統計信賴區間。",
+    "網站較早的DSSC55×55 A只有Voc／lux／環境，與38–40 mA沒有同條件配對。voltageObservation保留2026-10-26快照、日期、匹配條件、排除期、URL，並分開保存網站聲明的logger雜湊與獨立下載核對的公開CSV雜湊。完整日Voc依匹配後的每小時中位數再取日中位數。",
+    "早期A基準497.1mV、942.5lux；10/25可比Voc328.625mV，66.108%是電壓保留率，不用來縮放Isc／功率。不把全日lux中位數當作可比Voc子集的同步照度。",
+    "Same-light模式不假定942.5lux或100mW/cm²；effectiveJscMaCm2與參考mW/cm²為null。Lux-ratio需電流同步照度、同光譜／幾何，無通用lux→mW/cm²換算。",
+    "選線上電壓觀測時scenario=null，因Voc與Isc未配對，不混合反推FTO I–V／MPP；FTO幾何電阻仍保留。電壓日期選擇不推算電流老化。",
+    "TEC7/8/10/15/20 典型方塊電阻 7/8/10/13/19 Ω/□，來源 NSG GL058 March 2024 p11；可自訂兩片實測值。TEC15 不等於恰好 15 Ω/□，且品級的透光／haze 影響未建模。",
+    "FTO 等效 R=Rsheet*(A/(3W²)+lead/W)，逐 cell／雙片相加，僅為均勻整邊集流的等效條帶近似，不是 retained-FTO 2D 求解、也不含接觸／電解液／Pt 電阻。",
+    "electrical.scenario 以 a*ln(1+(Iph-I)/I0) 逐 cell 電壓相加扣 I*R 求 Isc／MPP；超出 forward branch 時以弱光電流截斷並標記，不聲稱求出逆偏 I–V。",
+    "a 預設 50 mV 未擬合。對照 Rs 是獨立歷史輸入，用於去嵌入；預設 0 暫忽略對照損失，可能重複計入既有 FTO 損失。情境不是校正後成品預測。",
+    "Bigger / Smaller Electrode 分別對應相容檔名 glass-6066 / glass-6060；不再以固定尺寸命名介面。",
+    "electrical.cellIscMa 是逐 cell 的面積電流基準；limitingCellNumber 為最小有效面積 cell（從 1 起算）。含 FTO 的 Isc 在 scenario.iscMa，切勿把兩者當同一量測。",
+    "laser-fill/：toolpaths.json 及兩片 beam-centre fill SVG；laser ON 僅在每段內，段間移動 OFF。需設備校正 power/speed/kerf。",
+    "雷射圓形光斑角點可殘留約半徑尺度，交會區重複曝光需校正；檔案不是機台控制協定。",
     "svg-layered/：七個完整分層 SVG，包含參考圖與非印刷導引。",
     "svg-production/：兩片二值網版、兩片已移除 GUIDES_NON_PRINTING 的 FTO 蝕刻中心線與 binding-mask。",
     "pdf-production/：與五個製造 SVG 實體尺寸一致的向量 PDF。",
     "bitmap-production/：兩片二值網版的 1-bit 1200 DPI TIFF。",
-    "pdf-preview/assembly-preview.pdf：66 x 60 mm 基準組裝預覽。",
-    "manufacturing-layout.dxf：兩片 TiO2 region、白色 point knockout CIRCLE、canonical FTO、circuit reference 與 BINDING 分層資料。",
-    "fto-galvo-toolpaths.json：v3 中性交換格式，逐片保存 canonical etchPaths 與 terminal-isolation metadata。",
+    `pdf-preview/assembly-preview.pdf：${config.glass6066WidthMm} x ${config.glassHeightMm} mm 組裝參考，含斑馬條接觸位置標示。`,
+    "manufacturing-layout.dxf：兩片 TiO2 region、canonical FTO、circuit reference 與 BINDING 分層資料。",
+    "fto-galvo-toolpaths.json：v4 中性交換格式，逐片保存canonical etchPaths與voronoi-bleed metadata。",
     "",
     "校正警告：製造前必須依材料、binding、網印、TIFF RIP 與雷射設備試片，重新校正線寬、實際尺寸、鏡射方向及對位；不可直接把名義值視為設備校正值。",
     "",
@@ -851,12 +868,13 @@ export async function downloadProjectBundle(
     "design.json",
     `${JSON.stringify(
       {
-        format: "w-series-dssc-project-v4",
+        format: "w-series-dssc-project-v9",
         units: "mm",
         description:
-          "Circuit-derived per-plate TiO2 regions use fixed-radius Demaine-site point knockouts; canonical etchPaths include source-specific metadata and terminal-isolation cuts.",
+          "Active-area-balanced DSSC; unframed Voronoi bleed etch, shared seal, fill ports and retained-FTO geometry. Process and electrical values are estimates.",
         config,
         geometry,
+        zebraContactReference: zebraContactRegions(geometry),
         pointCodeArtwork,
       },
       null,
@@ -870,6 +888,27 @@ export async function downloadProjectBundle(
   );
   report("建立製造 DXF");
   addText("fto-galvo-toolpaths.json", buildGalvoToolpaths(config, geometry));
+  addText("laser-fill/toolpaths.json", `${JSON.stringify(laserFillExport(config, geometry), null, 2)}\n`);
+  for (const plate of ["glass-6066", "glass-6060"] as const) {
+    addText(`laser-fill/${plate}-fill.svg`, laserFillSvg(config, geometry, plate));
+  }
+  addText("process-estimates.json", `${JSON.stringify({
+    seal: sealProcess(config), electrical: electricalEstimate(config, geometry.fabrication.cellAreasMm2, geometry),
+    cellAreasMm2: geometry.fabrication.cellAreasMm2, areaCv: geometry.fabrication.areaCv,
+    coatingClearance: geometry.fabrication.coatingClearance,
+    zebraContacts: zebraContactRegions(geometry),
+    actualStencil: { areaMm2: geometry.fabrication.sealPrintAreaMm2,
+      nominalVolumeSpreadMm: geometry.fabrication.volumeSpreadMm, scenarioEnvelopeSpreadMm: geometry.fabrication.envelopeSpreadMm,
+      minimumScenarioClearMm: geometry.fabrication.minimumChannelMm, compressionValid: geometry.fabrication.compressionValid },
+    apertureDesign: { minimumPrintedOpeningMm: geometry.fabrication.minimumPrintedChannelMm,
+      scenario: geometry.fabrication.openingScenario, minimumScenarioClearMm: geometry.fabrication.minimumChannelMm,
+      pressedOpeningMeasured: false },
+    fto6066Terminals: geometry.fabrication.terminalCheck,
+    isolationRoutes: geometry.fabrication.isolationRoutes,
+    voronoiBleedCheck: geometry.fabrication.bleedCheck,
+    ports: geometry.fabrication.ports,
+    provenance: { viscosity: "Everlight Eversolar AB-313 TDS 20180206 V.1, p1: 38000 ± 8000 mPa.s at 25°C", beadD50: "User: median 15 µm, grade 1000 mesh", other: "User-adjustable engineering assumptions; see PROCESS_MODEL.md" },
+  }, null, 2)}\n`);
   report("建立 Galvo 蝕刻路徑");
 
   for (const item of exportAssets) {

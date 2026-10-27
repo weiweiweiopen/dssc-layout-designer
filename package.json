@@ -5,12 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/build-notices.mjs",
+    "preview": "vite preview",
+    "manifest:dist": "node scripts/dist-manifest.mjs",
     "test": "vitest run",
     "test:browser": "node scripts/browser-smoke.mjs",
+    "sync:app": "node scripts/sync-app.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
+    "clipper-lib": "^6.4.2",
     "d3-delaunay": "^6.0.4",
     "fflate": "^0.8.2",
     "jspdf": "^4.2.1",
@@ -19,6 +23,7 @@
     "svg2pdf.js": "^2.6.0"
   },
   "devDependencies": {
+    "@types/clipper-lib": "^6.4.0",
     "@types/d3-delaunay": "^6.0.4",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",

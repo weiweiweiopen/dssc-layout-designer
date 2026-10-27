@@ -1,2142 +1,553 @@
 import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isDeepStrictEqual } from "node:util";
-
+import { tmpdir } from "node:os";
 import { strFromU8, unzipSync } from "fflate";
 import puppeteer from "puppeteer-core";
 
-const appUrl = process.env.APP_URL ?? "http://127.0.0.1:5173";
-const storageKey = "w-series-voronoi-layout-v4";
-const legacyStorageKeys = [
-  "w-series-voronoi-layout",
-  "w-series-voronoi-layout-v1",
-  "w-series-voronoi-layout-v2",
-  "w-series-voronoi-layout-v3",
-];
-const relevantStorageKeys = [...legacyStorageKeys, storageKey];
-const defaultText = "SOLAR ORACLE WALKMAN";
-const replacementText = "TPMBS PSBDMF XBMLNBO";
-const spacesText = " ".repeat(defaultText.length);
-const viewLabels = [
-  "Final Assembly",
-  "Circuit",
-  "Screen 6066",
-  "Screen 6060",
-  "Etch 6066",
-  "Etch 6060",
-  "Binding",
-];
-const configKeys = [
-  "bindingWidthMm",
-  "electrodeJitter",
-  "electrodeSeed",
-  "ftoEtchWidthMm",
-  "glass6060HeightMm",
-  "glass6060WidthMm",
-  "glass6066HeightMm",
-  "glass6066WidthMm",
-  "mirrorGlass6060",
-  "subcellCount",
-  "text",
-].sort();
-const removedConfigKeys = [
-  "dye1Color",
-  "dye2Color",
-  "electrodeGapMm",
-  "fontEdgeWidthMm",
-  "fontMarginMm",
-  "fontSiteRadiusMm",
-  "repeatText",
-  "showFontSites",
-  "surlynWidthMm",
-];
-const geometryKeys = [
-  "active",
-  "activePerimeter",
-  "bindingInner",
-  "bindingOuter",
-  "boundaries",
-  "cells",
-  "electronPath",
-  "etchPaths",
-  "glass6060",
-  "glass6066",
-  "overlap",
-  "rowCount",
-  "terminals",
-].sort();
-const pointCodeKeys = [
-  "codeEmMm",
-  "letterCount",
-  "normalizedText",
-  "placements",
-  "slotCount",
-  "slotsPerSubcell",
-  "spaceCount",
-].sort();
-const placementKeys = [
-  "character",
-  "sites",
-  "slotIndex",
-  "slotIndexInSubcell",
-  "subcellIndex",
-].sort();
-const expectedBundlePaths = [
-  "README.txt",
-  "bitmap-production/screen-glass-6060-tio2-1bit-1200dpi.tif",
-  "bitmap-production/screen-glass-6066-tio2-1bit-1200dpi.tif",
-  "design.json",
-  "fto-galvo-toolpaths.json",
-  "manufacturing-layout.dxf",
-  "pdf-preview/assembly-preview.pdf",
-  "pdf-production/binding-mask.pdf",
-  "pdf-production/fto-etch-glass-6060.pdf",
-  "pdf-production/fto-etch-glass-6066.pdf",
-  "pdf-production/screen-glass-6060-tio2.pdf",
-  "pdf-production/screen-glass-6066-tio2.pdf",
-  "svg-layered/assembly-preview.svg",
-  "svg-layered/binding-mask.svg",
-  "svg-layered/circuit-reference.svg",
-  "svg-layered/fto-etch-glass-6060.svg",
-  "svg-layered/fto-etch-glass-6066.svg",
-  "svg-layered/screen-glass-6060-tio2.svg",
-  "svg-layered/screen-glass-6066-tio2.svg",
-  "svg-production/binding-mask.svg",
-  "svg-production/fto-etch-glass-6060.svg",
-  "svg-production/fto-etch-glass-6066.svg",
-  "svg-production/screen-glass-6060-tio2.svg",
-  "svg-production/screen-glass-6066-tio2.svg",
-].sort();
-const tiffPaths = [
-  "bitmap-production/screen-glass-6066-tio2-1bit-1200dpi.tif",
-  "bitmap-production/screen-glass-6060-tio2-1bit-1200dpi.tif",
-];
-const popcount = Uint8Array.from({ length: 256 }, (_, value) => {
-  let count = 0;
-  for (let bits = value; bits !== 0; bits >>>= 1) count += bits & 1;
-  return count;
-});
-
-function ensure(condition, message) {
-  if (!condition) throw new Error(message);
+const url = process.env.APP_URL ?? "http://127.0.0.1:5173";
+const storageKey = "w-series-voronoi-layout-v6";
+const temporaryRoot = process.env.TEST_TMPDIR ?? tmpdir();
+const ensure = (condition, message) => { if (!condition) throw new Error(message); };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let executablePath;
+for (const p of [process.env.CHROME_PATH, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", "/usr/bin/chromium"].filter(Boolean)) {
+  try { await access(p); executablePath = p; break; } catch { /* next */ }
 }
-
-function sameArray(actual, expected, message) {
-  ensure(isDeepStrictEqual(actual, expected), `${message}: ${JSON.stringify(actual)}`);
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function isGrayscale(color) {
-  const hex = color.slice(1);
-  const expanded =
-    hex.length === 3 || hex.length === 4
-      ? [...hex].map((digit) => digit + digit).join("")
-      : hex;
-  return (
-    expanded.length >= 6 &&
-    expanded.slice(0, 2).toLowerCase() === expanded.slice(2, 4).toLowerCase() &&
-    expanded.slice(2, 4).toLowerCase() === expanded.slice(4, 6).toLowerCase()
-  );
-}
-
-function ensureGrayscale(colors, label) {
-  ensure(colors.length > 0, `${label} contains no hexadecimal colors.`);
-  ensure(
-    colors.every(isGrayscale),
-    `${label} contains a non-grayscale color: ${JSON.stringify(colors)}`,
-  );
-}
-
-function svgGroupContents(svg, id) {
-  const marker = `<g id="${id}"`;
-  const start = svg.indexOf(marker);
-  ensure(start >= 0, `Missing SVG group ${id}.`);
-  const openingEnd = svg.indexOf(">", start);
-  const tokens = /<g\b[^>]*>|<\/g>/g;
-  tokens.lastIndex = openingEnd + 1;
-  let depth = 1;
-  let token;
-  while ((token = tokens.exec(svg)) !== null) {
-    depth += token[0].startsWith("</") ? -1 : 1;
-    if (depth === 0) return svg.slice(openingEnd + 1, token.index);
-  }
-  throw new Error(`Unterminated SVG group ${id}.`);
-}
-
-function svgElements(content, tag) {
-  return (
-    content.match(new RegExp(`<${tag}\\b[^>]*?(?:\/>|>[\\s\\S]*?<\/${tag}>)`, "g")) ??
-    []
-  );
-}
-
-function svgAttribute(element, name) {
-  return element.match(new RegExp(`\\s${name}="([^"]*)"`))?.[1] ?? "";
-}
-
-function closeNumber(actual, expected, tolerance = 1e-8) {
-  return (
-    Number.isFinite(actual) &&
-    Number.isFinite(expected) &&
-    Math.abs(actual - expected) <=
-      tolerance * Math.max(1, Math.abs(actual), Math.abs(expected))
-  );
-}
-
-function samePoint(actual, expected) {
-  return closeNumber(actual?.x, expected?.x) && closeNumber(actual?.y, expected?.y);
-}
-
-function polygonVertexCount(polygon) {
-  return polygon.length > 1 && samePoint(polygon[0], polygon.at(-1))
-    ? polygon.length - 1
-    : polygon.length;
-}
-
-function maximalOwnedSideSpan(polygon, active, side) {
-  const vertexCount = polygonVertexCount(polygon);
-  const sideX = side === "left" ? active.x : active.x + active.width;
-  const scale = Math.max(
-    1,
-    Math.abs(sideX),
-    Math.abs(active.y),
-    active.width,
-    active.height,
-  );
-  const tolerance = 1e-9 * scale;
-  const intervals = [];
-  for (let index = 0; index < vertexCount; index += 1) {
-    const start = polygon[index];
-    const end = polygon[(index + 1) % vertexCount];
-    if (
-      Math.abs(start.x - sideX) <= tolerance &&
-      Math.abs(end.x - sideX) <= tolerance
-    ) {
-      const top = Math.min(start.y, end.y);
-      const bottom = Math.max(start.y, end.y);
-      if (bottom - top > tolerance) intervals.push({ top, bottom });
-    }
-  }
-  intervals.sort((first, second) => first.top - second.top);
-  const merged = [];
-  for (const interval of intervals) {
-    const previous = merged.at(-1);
-    if (previous && interval.top <= previous.bottom + tolerance) {
-      previous.bottom = Math.max(previous.bottom, interval.bottom);
-    } else {
-      merged.push({ ...interval });
-    }
-  }
-  const maximal = merged.reduce(
-    (longest, interval) =>
-      !longest || interval.bottom - interval.top > longest.bottom - longest.top
-        ? interval
-        : longest,
-    null,
-  );
-  return maximal
-    ? {
-        start: { x: sideX, y: maximal.top },
-        end: { x: sideX, y: maximal.bottom },
-      }
-    : null;
-}
-
-function segmentAmount(segment, point) {
-  const width = segment.end.x - segment.start.x;
-  const height = segment.end.y - segment.start.y;
-  if (Math.abs(width) >= Math.abs(height)) {
-    return width === 0 ? 0 : (point.x - segment.start.x) / width;
-  }
-  return height === 0 ? 0 : (point.y - segment.start.y) / height;
-}
-
-function interpolate(start, end, amount) {
-  return {
-    x: start.x + (end.x - start.x) * amount,
-    y: start.y + (end.y - start.y) * amount,
-  };
-}
-
-function expectedCanonicalEtchPaths(geometry, plate) {
-  const selectedBoundaries = geometry.boundaries.flatMap((boundary, boundaryIndex) =>
-    boundary.etchPlates.includes(plate)
-      ? [
-          {
-            source: "electrode-voronoi",
-            plate,
-            boundaryIndex,
-            cells: [...boundary.cells],
-            start: { ...boundary.start },
-            end: { ...boundary.end },
-          },
-        ]
-      : [],
-  );
-  const perimeterPaths = [];
-  geometry.activePerimeter.forEach((segment, perimeterIndex) => {
-    const gate =
-      plate === "glass-6066"
-        ? perimeterIndex === 1
-          ? geometry.terminals[1].gate
-          : perimeterIndex === 3
-            ? geometry.terminals[0].gate
-            : undefined
-        : undefined;
-    const intervals = [];
-    if (gate && Math.hypot(gate.end.x - gate.start.x, gate.end.y - gate.start.y) > 0) {
-      const first = Math.min(1, Math.max(0, segmentAmount(segment, gate.start)));
-      const second = Math.min(1, Math.max(0, segmentAmount(segment, gate.end)));
-      const gateStart = Math.min(first, second);
-      const gateEnd = Math.max(first, second);
-      if (gateStart > 0) intervals.push([0, gateStart]);
-      if (gateEnd < 1) intervals.push([gateEnd, 1]);
-    } else {
-      intervals.push([0, 1]);
-    }
-    intervals.forEach(([startAmount, endAmount], pieceIndex) => {
-      perimeterPaths.push({
-        source: "active-perimeter",
-        plate,
-        perimeterIndex,
-        pieceIndex,
-        start: interpolate(segment.start, segment.end, startAmount),
-        end: interpolate(segment.start, segment.end, endAmount),
-      });
-    });
-  });
-  const glass = plate === "glass-6066" ? geometry.glass6066 : geometry.glass6060;
-  const centerX = geometry.active.x + geometry.active.width / 2;
-  return [
-    ...selectedBoundaries,
-    ...perimeterPaths,
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 0,
-      start: { x: centerX, y: glass.y },
-      end: { x: centerX, y: geometry.active.y },
-    },
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 1,
-      start: { x: centerX, y: geometry.active.y + geometry.active.height },
-      end: { x: centerX, y: glass.y + glass.height },
-    },
-  ];
-}
-
-function validateProjectGeometry(project) {
-  const { config, geometry } = project;
-  sameArray(Object.keys(config).sort(), configKeys, "Unexpected design config fields");
-  sameArray(Object.keys(geometry).sort(), geometryKeys, "Unexpected design geometry fields");
-  ensure(
-    geometry.cells.length === config.subcellCount,
-    "Exported electrical cell count differs from config.subcellCount.",
-  );
-  geometry.cells.forEach((cell, index) => {
-    ensure(
-      cell.index === index &&
-        cell.glass6066Material === (index % 2 === 0 ? "tio2" : "pt") &&
-        cell.glass6060Material === (index % 2 === 0 ? "pt" : "tio2"),
-      `Exported cell ${index} has incorrect material parity.`,
-    );
-  });
-
-  const expectedPerimeter = [
-    {
-      start: { x: geometry.active.x, y: geometry.active.y },
-      end: { x: geometry.active.x + geometry.active.width, y: geometry.active.y },
-    },
-    {
-      start: { x: geometry.active.x + geometry.active.width, y: geometry.active.y },
-      end: {
-        x: geometry.active.x + geometry.active.width,
-        y: geometry.active.y + geometry.active.height,
-      },
-    },
-    {
-      start: {
-        x: geometry.active.x + geometry.active.width,
-        y: geometry.active.y + geometry.active.height,
-      },
-      end: { x: geometry.active.x, y: geometry.active.y + geometry.active.height },
-    },
-    {
-      start: { x: geometry.active.x, y: geometry.active.y + geometry.active.height },
-      end: { x: geometry.active.x, y: geometry.active.y },
-    },
-  ];
-  ensure(
-    isDeepStrictEqual(geometry.activePerimeter, expectedPerimeter),
-    "The exported active perimeter is not the canonical full rectangle.",
-  );
-  ensure(geometry.terminals.length === 2, "Expected exactly two exported terminals.");
-
-  const terminalExpectations = [
-    { polarity: "negative", side: "left", cellIndex: 0 },
-    { polarity: "positive", side: "right", cellIndex: geometry.cells.length - 1 },
-  ];
-  const gateLengths = [];
-  geometry.terminals.forEach((terminal, index) => {
-    const expectation = terminalExpectations[index];
-    ensure(
-      terminal.polarity === expectation.polarity &&
-        terminal.plate === "glass-6066" &&
-        terminal.cellIndex === expectation.cellIndex,
-      `Terminal ${index} has incorrect identity or plate metadata.`,
-    );
-    const strip = terminal.contactStrip;
-    ensure(
-      strip.width > 0 &&
-        closeNumber(strip.y, geometry.glass6066.y) &&
-        closeNumber(strip.height, geometry.glass6066.height),
-      `Terminal ${index} is not a positive-width full-height 6066 contact strip.`,
-    );
-    const expectedGate = maximalOwnedSideSpan(
-      geometry.cells[expectation.cellIndex].polygon,
-      geometry.active,
-      expectation.side,
-    );
-    ensure(expectedGate, `Unable to derive the full span for terminal gate ${index}.`);
-    ensure(
-      terminal.gate.polarity === expectation.polarity &&
-        terminal.gate.plate === "glass-6066" &&
-        terminal.gate.cellIndex === expectation.cellIndex &&
-        terminal.gate.side === expectation.side &&
-        samePoint(terminal.gate.start, expectedGate.start) &&
-        samePoint(terminal.gate.end, expectedGate.end),
-      `Terminal ${index} gate does not cover its endpoint cell's full facing-side span.`,
-    );
-    const expectedContact = {
-      x: strip.x + strip.width / 2,
-      y: (expectedGate.start.y + expectedGate.end.y) / 2,
-    };
-    ensure(samePoint(terminal.contact, expectedContact), `Terminal ${index} contact is misaligned.`);
-    gateLengths.push(Math.hypot(
-      terminal.gate.end.x - terminal.gate.start.x,
-      terminal.gate.end.y - terminal.gate.start.y,
-    ));
-  });
-
-  const etchCounts = {};
-  for (const plate of ["glass-6066", "glass-6060"]) {
-    const canonical = expectedCanonicalEtchPaths(geometry, plate);
-    ensure(
-      isDeepStrictEqual(geometry.etchPaths[plate], canonical),
-      `${plate} geometry.etchPaths is not canonical.`,
-    );
-    const isolation = canonical.filter(({ source }) => source === "terminal-isolation");
-    sameArray(
-      isolation.map(({ isolationIndex }) => isolationIndex),
-      [0, 1],
-      `${plate} terminal-isolation indexes are incorrect`,
-    );
-    etchCounts[plate] = canonical.length;
-  }
-  return { gateLengths, etchCounts };
-}
-
-function validateGalvo(galvo, project) {
-  ensure(
-    galvo.format === "w-series-dssc-galvo-toolpath-v3",
-    `Unexpected Galvo format ${String(galvo.format)}.`,
-  );
-  ensure(galvo.units === "mm", "Galvo units are not millimetres.");
-  ensure(
-    /terminal-isolation/.test(galvo.description ?? ""),
-    "Galvo description omits terminal isolation.",
-  );
-  ensure(
-    galvo.interchange?.neutral === true &&
-      galvo.interchange?.deviceWireProtocol === false,
-    "Galvo interchange metadata is not neutral v3 output.",
-  );
-  ensure(
-    !/FONT_|fontArtwork|microcell|data-slot|data-site|glyph-|pointCode|knockout/i.test(
-      JSON.stringify(galvo),
-    ),
-    "Galvo output contains point-code or removed font data.",
-  );
-  const counts = {};
-  for (const plate of ["glass-6066", "glass-6060"]) {
-    const sourcePaths = project.geometry.etchPaths[plate];
-    const outputPlate = galvo.plates?.[plate];
-    const rect =
-      plate === "glass-6066"
-        ? project.geometry.glass6066
-        : project.geometry.glass6060;
-    ensure(outputPlate, `Galvo output is missing ${plate}.`);
-    ensure(
-      outputPlate.widthMm === rect.width && outputPlate.heightMm === rect.height,
-      `${plate} Galvo dimensions are incorrect.`,
-    );
-    ensure(
-      outputPlate.mirroredHorizontally ===
-        (plate === "glass-6060" && project.config.mirrorGlass6060),
-      `${plate} Galvo mirror metadata is incorrect.`,
-    );
-    ensure(
-      outputPlate.paths.length === sourcePaths.length,
-      `${plate} Galvo path count differs from canonical geometry.`,
-    );
-    outputPlate.paths.forEach((path, index) => {
-      const source = sourcePaths[index];
-      ensure(
-        path.id === `${plate}-etch-${index}` &&
-          path.source === source.source &&
-          path.plate === source.plate &&
-          path.widthMm === project.config.ftoEtchWidthMm,
-        `${plate} Galvo path ${index} has incorrect canonical metadata.`,
-      );
-      for (const key of [
-        "boundaryIndex",
-        "cells",
-        "perimeterIndex",
-        "pieceIndex",
-        "isolationIndex",
-      ]) {
-        ensure(
-          isDeepStrictEqual(path[key], source[key]),
-          `${plate} Galvo path ${index} has incorrect ${key}.`,
-        );
-      }
-      [source.start, source.end].forEach((point, pointIndex) => {
-        const localX = point.x - rect.x;
-        const expected = {
-          x:
-            plate === "glass-6060" && project.config.mirrorGlass6060
-              ? rect.width - localX
-              : localX,
-          y: point.y - rect.y,
-        };
-        const actual = path.points[pointIndex];
-        ensure(samePoint(actual, expected), `${plate} Galvo path ${index} endpoint is incorrect.`);
-        const expectedNormalized = {
-          x: Math.min(1, Math.max(-1, (expected.x / rect.width) * 2 - 1)),
-          y: Math.min(1, Math.max(-1, (expected.y / rect.height) * 2 - 1)),
-        };
-        ensure(
-          samePoint(actual.normalized, expectedNormalized),
-          `${plate} Galvo path ${index} normalized endpoint is incorrect.`,
-        );
-      });
-    });
-    const isolation = outputPlate.paths.filter(
-      ({ source }) => source === "terminal-isolation",
-    );
-    sameArray(
-      isolation.map(({ isolationIndex }) => isolationIndex),
-      [0, 1],
-      `${plate} Galvo terminal-isolation paths are incorrect`,
-    );
-    counts[plate] = outputPlate.paths.length;
-  }
-  return counts;
-}
-
-function parseBilevelTiff(bytes, filename, expectedWidth, expectedHeight) {
-  ensure(bytes.byteLength >= 8, `${filename} is too short to be a TIFF.`);
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  ensure(bytes[0] === 0x49 && bytes[1] === 0x49, `${filename} does not have II magic.`);
-  ensure(view.getUint16(2, true) === 42, `${filename} does not have TIFF42 magic.`);
-  const ifdOffset = view.getUint32(4, true);
-  ensure(ifdOffset + 2 <= bytes.byteLength, `${filename} has an invalid IFD offset.`);
-  const entryCount = view.getUint16(ifdOffset, true);
-  const entries = new Map();
-  for (let index = 0; index < entryCount; index += 1) {
-    const entryOffset = ifdOffset + 2 + index * 12;
-    ensure(entryOffset + 12 <= bytes.byteLength, `${filename} has a truncated IFD.`);
-    const tag = view.getUint16(entryOffset, true);
-    ensure(!entries.has(tag), `${filename} repeats TIFF tag ${tag}.`);
-    entries.set(tag, {
-      type: view.getUint16(entryOffset + 2, true),
-      count: view.getUint32(entryOffset + 4, true),
-      valueOffset: view.getUint32(entryOffset + 8, true),
-      entryOffset,
-    });
-  }
-  const expectedTags = [256, 257, 258, 259, 262, 273, 274, 277, 278, 279, 282, 283, 296];
-  sameArray([...entries.keys()], expectedTags, `${filename} TIFF tags are incorrect`);
-  const nextIfdOffsetPosition = ifdOffset + 2 + entryCount * 12;
-  ensure(nextIfdOffsetPosition + 4 <= bytes.byteLength, `${filename} has no next-IFD field.`);
-  ensure(view.getUint32(nextIfdOffsetPosition, true) === 0, `${filename} has extra IFDs.`);
-
-  const entry = (tag, type) => {
-    const value = entries.get(tag);
-    ensure(value, `${filename} is missing TIFF tag ${tag}.`);
-    ensure(
-      value.type === type && value.count === 1,
-      `${filename} TIFF tag ${tag} has the wrong type or count.`,
-    );
-    return value;
-  };
-  const short = (tag) => view.getUint16(entry(tag, 3).entryOffset + 8, true);
-  const long = (tag) => entry(tag, 4).valueOffset;
-  const rational = (tag) => {
-    const value = entry(tag, 5);
-    ensure(value.valueOffset + 8 <= bytes.byteLength, `${filename} has an invalid rational.`);
-    return [
-      view.getUint32(value.valueOffset, true),
-      view.getUint32(value.valueOffset + 4, true),
-    ];
-  };
-
-  const width = long(256);
-  const height = long(257);
-  ensure(width === expectedWidth && height === expectedHeight, `${filename} is ${width}x${height}.`);
-  ensure(short(258) === 1, `${filename} BitsPerSample is not 1.`);
-  ensure(short(259) === 1, `${filename} Compression is not 1 (uncompressed).`);
-  ensure(short(262) === 0, `${filename} Photometric is not WhiteIsZero.`);
-  ensure(short(274) === 1, `${filename} Orientation is not top-left (1).`);
-  ensure(short(277) === 1, `${filename} SamplesPerPixel is not 1.`);
-  ensure(long(278) === height, `${filename} is not stored as one full-height strip.`);
-  ensure(short(296) === 2, `${filename} ResolutionUnit is not inch.`);
-  sameArray(rational(282), [1200, 1], `${filename} XResolution is not 1200/1`);
-  sameArray(rational(283), [1200, 1], `${filename} YResolution is not 1200/1`);
-
-  const stripOffset = long(273);
-  const stripByteCount = long(279);
-  const rowBytes = Math.ceil(width / 8);
-  ensure(
-    stripByteCount === rowBytes * height && stripOffset + stripByteCount <= bytes.byteLength,
-    `${filename} has an invalid packed strip.`,
-  );
-  const usedBits = width & 7;
-  const validLastByteMask = usedBits === 0 ? 0xff : (0xff << (8 - usedBits)) & 0xff;
-  const paddingMask = 0xff ^ validLastByteMask;
-  let blackPixels = 0;
-  for (let y = 0; y < height; y += 1) {
-    const rowOffset = stripOffset + y * rowBytes;
-    for (let byteIndex = 0; byteIndex < rowBytes; byteIndex += 1) {
-      const mask = byteIndex === rowBytes - 1 ? validLastByteMask : 0xff;
-      blackPixels += popcount[bytes[rowOffset + byteIndex] & mask];
-    }
-    ensure(
-      (bytes[rowOffset + rowBytes - 1] & paddingMask) === 0,
-      `${filename} has nonzero row-padding bits.`,
-    );
-  }
-  const whitePixels = width * height - blackPixels;
-  ensure(blackPixels > 0 && whitePixels > 0, `${filename} lacks black or white valid pixels.`);
-
-  const blackAt = (x, y) => {
-    const offset = stripOffset + y * rowBytes + (x >> 3);
-    return (bytes[offset] & (0x80 >> (x & 7))) !== 0;
-  };
-  for (let x = 0; x < width; x += 1) {
-    ensure(!blackAt(x, 0), `${filename} has a black top-edge pixel.`);
-    ensure(!blackAt(x, height - 1), `${filename} has a black bottom-edge pixel.`);
-  }
-  for (let y = 0; y < height; y += 1) {
-    ensure(!blackAt(0, y), `${filename} has a black left-edge pixel.`);
-    ensure(!blackAt(width - 1, y), `${filename} has a black right-edge pixel.`);
-  }
-
-  // Each strip byte packs eight bilevel samples; byte values are not grayscale pixels.
-  return {
-    width,
-    height,
-    bitsPerSample: 1,
-    blackPixels,
-    whitePixels,
-    rowPaddingBits: usedBits === 0 ? 0 : 8 - usedBits,
-  };
-}
-
-function validateProductionEtch(svg, suffix, canonicalPaths, expectedWidth) {
-  ensure(!/GUIDE/i.test(svg), `Production ${suffix} etch SVG contains guides.`);
-  ensure(
-    !/FONT_|fontArtwork|microcell|data-slot|data-site|glyph-|POINT_CODE|knockout/i.test(svg),
-    `Production ${suffix} etch SVG contains point-code or removed font data.`,
-  );
-  ensure(!/<text\b|<circle\b/i.test(svg), `Production ${suffix} etch SVG has annotations.`);
-  ensure(!/stroke-dasharray/i.test(svg), `Production ${suffix} etch SVG has dashed strokes.`);
-  const opening = svg.match(new RegExp(`<g\\b[^>]*\\sid="FTO_ETCH_${suffix}"[^>]*>`))?.[0] ?? "";
-  ensure(
-    svgAttribute(opening, "stroke-width") === String(expectedWidth),
-    `Production ${suffix} etch width is not ${expectedWidth} mm.`,
-  );
-  const operative = svgElements(svgGroupContents(svg, `FTO_ETCH_${suffix}`), "path");
-  ensure(
-    operative.length === canonicalPaths.length,
-    `Production ${suffix} etch path count is not canonical.`,
-  );
-  operative.forEach((path, index) => {
-    ensure(
-      svgAttribute(path, "data-path-index") === String(index) &&
-        svgAttribute(path, "data-source") === canonicalPaths[index].source,
-      `Production ${suffix} etch path ${index} is out of canonical order.`,
-    );
-  });
-  const isolationCount = operative.filter(
-    (path) => svgAttribute(path, "data-source") === "terminal-isolation",
-  ).length;
-  ensure(isolationCount === 2, `Production ${suffix} etch SVG lacks two isolation paths.`);
-  return operative.length;
-}
-
-function validatePdf(bytes, filename) {
-  ensure(bytes.byteLength > 8, `${filename} is too short to be a PDF.`);
-  ensure(
-    String.fromCharCode(...bytes.slice(0, 5)) === "%PDF-",
-    `${filename} does not have PDF magic.`,
-  );
-  const trailer = String.fromCharCode(...bytes.slice(Math.max(0, bytes.length - 2048)));
-  ensure(trailer.includes("%%EOF"), `${filename} does not have a PDF EOF marker.`);
-}
-
-function dxfRecords(dxf) {
-  const lines = dxf.trim().split(/\r?\n/);
-  ensure(lines.length % 2 === 0, "Manufacturing DXF has an incomplete group pair.");
-  return Array.from({ length: lines.length / 2 }, (_, index) => ({
-    code: lines[index * 2].trim(),
-    value: lines[index * 2 + 1].trim(),
-  }));
-}
-
-function declaredDxfLayers(records) {
-  const layers = [];
-  for (let index = 0; index < records.length; index += 1) {
-    if (records[index].code !== "0" || records[index].value !== "LAYER") continue;
-    for (let next = index + 1; next < records.length && records[next].code !== "0"; next += 1) {
-      if (records[next].code === "2") {
-        layers.push(records[next].value);
-        break;
-      }
-    }
-  }
-  return layers;
-}
-
-function dxfEntities(records) {
-  const sectionStart = records.findIndex(
-    (record, index) =>
-      record.code === "2" &&
-      record.value === "ENTITIES" &&
-      records[index - 1]?.code === "0" &&
-      records[index - 1]?.value === "SECTION",
-  );
-  ensure(sectionStart >= 0, "Manufacturing DXF has no ENTITIES section.");
-  const entities = [];
-  let current = null;
-  for (let index = sectionStart + 1; index < records.length; index += 1) {
-    const record = records[index];
-    if (record.code === "0" && record.value === "ENDSEC") break;
-    if (
-      record.code === "0" &&
-      ["CIRCLE", "LINE", "LWPOLYLINE"].includes(record.value)
-    ) {
-      if (current) entities.push(current);
-      current = { type: record.value, records: [] };
-    } else if (current) {
-      current.records.push(record);
-    }
-  }
-  if (current) entities.push(current);
-  return entities;
-}
-
-function dxfEntityLayer(entity) {
-  return entity.records.find(({ code }) => code === "8")?.value ?? "";
-}
-
-function dxfEntitiesOn(entities, layer) {
-  return entities.filter((entity) => dxfEntityLayer(entity) === layer);
-}
-
-function dxfEntityValue(entity, code) {
-  return entity.records.find((record) => record.code === code)?.value;
-}
-
-function dxfCircleId(entity) {
-  const comment = entity.records.find(
-    ({ code, value }) => code === "999" && value.startsWith("id="),
-  )?.value;
-  return comment?.slice(3) ?? "";
-}
-
-const chromeCandidates = [
-  process.env.CHROME_PATH,
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  "/usr/bin/google-chrome",
-  "/usr/bin/chromium",
-].filter(Boolean);
-
-let executablePath = "";
-for (const candidate of chromeCandidates) {
-  try {
-    await access(candidate);
-    executablePath = candidate;
-    break;
-  } catch {
-    // Try the next common Chrome location.
-  }
-}
-if (!executablePath) {
-  throw new Error("Chrome not found. Set CHROME_PATH to run the browser smoke test.");
-}
-
-const downloadDirectory = await mkdtemp(join(tmpdir(), "w-dssc-v4-smoke-"));
-const runtimeErrors = [];
-const browser = await puppeteer.launch({
-  executablePath,
-  headless: true,
-  args: ["--no-sandbox", "--disable-gpu"],
-});
-
+ensure(executablePath, "Chrome not found. Set CHROME_PATH.");
+const directory = await mkdtemp(join(temporaryRoot, "dssc-v6-smoke-"));
+const errors = [];
+const browser = await puppeteer.launch({ executablePath, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1440, height: 1000, deviceScaleFactor: 1 });
-  page.on("pageerror", (error) => runtimeErrors.push(`page: ${error.message}`));
-  page.on("console", (message) => {
-    if (message.type() === "error") runtimeErrors.push(`console: ${message.text()}`);
-  });
-
+  page.on("pageerror", (e) => errors.push(e.message));
   const client = await page.createCDPSession();
-  await client.send("Browser.setDownloadBehavior", {
-    behavior: "allow",
-    downloadPath: downloadDirectory,
-  });
-  await client.send("Storage.clearDataForOrigin", {
-    origin: new URL(appUrl).origin,
-    storageTypes: "local_storage",
-  });
-  await page.goto(appUrl, { waitUntil: "networkidle2", timeout: 30_000 });
-  await page.waitForSelector(".classic-window", { timeout: 30_000 });
-
-  const waitForReady = async () => {
-    await page.waitForFunction(
-      () =>
-        document.querySelector(".title-status")?.textContent?.trim() === "DRC pass" &&
-        !document.querySelector(".preview-frame.pending") &&
-        document.querySelector(".preview-frame svg") !== null,
-      { timeout: 30_000 },
-    );
+  await client.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: directory });
+  await page.goto(url, { waitUntil: "networkidle2" });
+  await page.evaluate(() => { localStorage.clear(); localStorage.setItem("dssc-layout-language", "en"); });
+  await page.reload({ waitUntil: "networkidle2" });
+  const ready = () => page.waitForFunction(() => document.querySelector(".title-status")?.dataset.state === "pass" && !document.querySelector(".preview-frame.pending"), { timeout: 30000 });
+  await ready();
+  const button = async (label) => {
+    ensure(await page.evaluate((text) => {
+      const b = [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === text);
+      if (!b || b.disabled) return false;
+      b.click(); return true;
+    }, label), `Unavailable button: ${label}`);
   };
-  await waitForReady();
-
-  const clickButton = async (label) => {
-    await page.waitForFunction(
-      (expected) =>
-        [...document.querySelectorAll("button")].some(
-          (button) => button.textContent?.trim() === expected && !button.disabled,
-        ),
-      { timeout: 30_000 },
-      label,
-    );
-    const clicked = await page.evaluate((expected) => {
-      const button = [...document.querySelectorAll("button")].find(
-        (candidate) => candidate.textContent?.trim() === expected,
-      );
-      if (!(button instanceof HTMLButtonElement) || button.disabled) return false;
-      button.click();
-      return true;
-    }, label);
-    ensure(clicked, `Unable to click exact button label "${label}".`);
-  };
-
-  const selectView = async (label, view) => {
-    await clickButton(label);
-    await page.waitForFunction(
-      (expectedLabel, expectedView) => {
-        const selected = document.querySelector(".view-toolbar button.selected");
-        const svg = document.querySelector(".preview-frame svg");
-        return (
-          selected?.textContent?.trim() === expectedLabel &&
-          svg?.getAttribute("data-view") === expectedView
-        );
-      },
-      { timeout: 30_000 },
-      label,
-      view,
-    );
-  };
-
-  const focusNumberField = async (label) => {
-    const focused = await page.evaluate((labelText) => {
-      const input = [...document.querySelectorAll("label.form-row")]
-        .find(
-          (row) =>
-            row.querySelector(":scope > span")?.textContent?.trim() === labelText,
-        )
-        ?.querySelector(".number-draft");
-      if (!(input instanceof HTMLInputElement)) return false;
-      input.focus();
-      input.select();
-      return document.activeElement === input;
-    }, label);
-    ensure(focused, `Unable to focus .number-draft for "${label}".`);
-  };
-
-  const setNumberField = async (label, value, commit) => {
-    await focusNumberField(label);
+  const field = async (label, value) => {
+    ensure(await page.evaluate((text) => {
+      const i = [...document.querySelectorAll("label.form-row")].find((r) => r.dataset.parameter === text)?.querySelector("input");
+      if (!i) return false; i.focus(); i.select(); return true;
+    }, label), `Missing field ${label}`);
     await page.keyboard.press("Backspace");
-    await page.keyboard.type(value);
-    if (commit === "enter") {
-      await page.keyboard.press("Enter");
-    } else {
-      const blurred = await page.evaluate((labelText) => {
-        const input = [...document.querySelectorAll("label.form-row")]
-          .find(
-            (row) =>
-              row.querySelector(":scope > span")?.textContent?.trim() === labelText,
-          )
-          ?.querySelector(".number-draft");
-        if (!(input instanceof HTMLInputElement)) return false;
-        input.blur();
-        return document.activeElement !== input;
-      }, label);
-      ensure(blurred, `Unable to blur .number-draft for "${label}".`);
+    await page.keyboard.type(String(value));
+    await page.keyboard.press("Enter");
+    await sleep(200);
+    await page.waitForFunction(() => !document.querySelector(".preview-frame.pending"), { timeout: 30000 });
+  };
+  const config = () => page.evaluate((key) => JSON.parse(localStorage.getItem(key)), storageKey);
+  const select = async (label, value) => {
+    await page.select(`[data-parameter="${label}"] select`, value);
+    await sleep(200); await ready();
+  };
+  ensure(await page.evaluate(() => !document.querySelector("textarea") && !/OVERLAP/.test(document.body.textContent)), "Removed UI is still present");
+  const original = await config();
+  // One app / one design: locale changes must not regenerate the geometry,
+  // reset view/camera/stage, or even commit an in-progress numeric draft.
+  await button("Binding");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="binding"]'));
+  await page.click('[data-testid="seal-stage-toggle"]');
+  await page.waitForFunction(() => document.querySelector('#BINDING_MASK')?.dataset.sealStage === "compression-scenario");
+  const work = await page.$(".preview-workspace");
+  const bounds = await work.boundingBox();
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await page.mouse.wheel({ deltaY: -200 }); await sleep(100);
+  const snapshot = () => page.evaluate((key) => ({
+    config: localStorage.getItem(key), svg: document.querySelector(".preview-frame").innerHTML,
+    camera: document.querySelector(".preview-camera").style.transform,
+    mode: document.querySelector("[data-view-mode].selected")?.dataset.viewMode,
+    stage: document.querySelector('[data-testid="seal-stage-toggle"]')?.checked,
+  }), storageKey);
+  const designBeforeLocale = await snapshot();
+  await page.focus('[data-parameter="Coating Safety Gap"] input');
+  await page.$eval('[data-parameter="Coating Safety Gap"] input', (el) => el.select());
+  await page.keyboard.type("0.25");
+  await page.click('[data-testid="language-zh-TW"]');
+  await page.waitForFunction(() => document.documentElement.lang === "zh-TW");
+  ensure(JSON.stringify(await snapshot()) === JSON.stringify(designBeforeLocale), "Chinese switch changed design, SVG, camera, mode or seal stage");
+  ensure(await page.$eval('[data-parameter="Coating Safety Gap"] input', (el) => el.value === "0.25"),
+    "Language switch lost an uncommitted numeric draft");
+  ensure(await page.$eval('[data-parameter="Coating Safety Gap"] > span', (el) => el.textContent === "塗層安全間距"),
+    "Chinese parameter labels were not applied");
+  await page.keyboard.press("Escape");
+  await page.click('[data-testid="language-en"]');
+  await page.waitForFunction(() => document.documentElement.lang === "en");
+  ensure(JSON.stringify(await snapshot()) === JSON.stringify(designBeforeLocale), "English switch regenerated the design");
+  ensure(await page.evaluate(() => {
+    const clone = document.body.cloneNode(true); clone.querySelector(".language-switch")?.remove();
+    return !/[\u3400-\u9fff]/.test(clone.textContent);
+  }), "English interface still contains Chinese visible text");
+  await page.click('[data-testid="language-zh-TW"]');
+  await page.reload({ waitUntil: "networkidle2" }); await ready();
+  ensure(await page.evaluate(() => document.documentElement.lang === "zh-TW" && localStorage.getItem("dssc-layout-language") === "zh-TW"),
+    "Language preference did not survive reload");
+  await page.$eval(".sidebar-panel", (el) => { el.scrollTop = 0; });
+  await page.screenshot({ path: join(directory, "interface-zh-TW.png") });
+  await page.click('[data-testid="language-en"]'); await ready();
+  await page.screenshot({ path: join(directory, "interface-en.png") });
+  ensure(await page.evaluate(() => {
+    const rows = [...document.querySelectorAll("label.form-row")];
+    return ["Shared Glass Height", "Bigger Electrode W", "Smaller Electrode W"]
+      .every((label) => rows.some((r) => r.dataset.parameter === label)) &&
+      !rows.some((r) => /Electrode H$/.test(r.dataset.parameter)) &&
+      rows.every((r) => r.dataset.help?.length > 20 && r.querySelector("input, select")?.getAttribute("aria-describedby")) &&
+      !document.querySelector(".parameter-note, [role=tooltip]");
+  }), "Role-based names or per-parameter help missing; old permanent notes remain");
+  await field("Shared Glass Height", 64);
+  await field("Bigger Electrode W", 70);
+  await field("Smaller Electrode W", 58);
+  await page.waitForFunction(() => {
+    const contacts = [...document.querySelectorAll('#ASSEMBLY_ZEBRA_CONTACTS > g')];
+    return contacts.length === 2 && contacts.every((g) => Number(g.dataset.stripWidthMm) === 6 &&
+      Number(g.dataset.stripHeightMm) === 64 && Math.abs(Number(g.dataset.areaMm2) - 384) < 1e-6);
+  });
+  ensure(await page.evaluate(() => [...document.querySelectorAll('[data-testid="assembly-contacts"] [data-area-mm2]')]
+    .every((el) => Math.abs(Number(el.dataset.areaMm2) - 384) < 1e-6)), "Contact readout does not follow resized exposed FTO");
+  await page.screenshot({ path: join(directory, "assembly-zebra-resized.png") });
+  await button("Screen Smaller");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="glass-6060"]')?.getAttribute("viewBox") === "0 0 58 64");
+  await button("Screen Bigger");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="glass-6066"]')?.getAttribute("viewBox") === "0 0 70 64");
+  await button("Final Assembly");
+  await field("Smaller Electrode W", 70);
+  await page.waitForFunction(() => document.querySelector('.warning-stack [data-code="contact-exposure"]'));
+  ensure(await page.evaluate(() => document.querySelectorAll('#ASSEMBLY_ZEBRA_CONTACTS > g').length === 0),
+    "Equal glass widths still display fictitious zebra contact area");
+  await button("Reset"); await ready();
+  await field("Bigger Electrode W", 70);
+  await field("Electrical Cells", 6);
+  await field("Seed", 4361322);
+  await field("Screen Mesh", 140);
+  await field("Wire Diameter", 14);
+  await field("Binding Width", 1);
+  await page.waitForFunction(() => {
+    const el = document.querySelector('[data-testid="coating-clearance"]');
+    return Number(el?.dataset.totalActiveMm2) > 2136.6 && Number(el?.dataset.scenarioMm) >= 0.19999;
+  });
+  await page.screenshot({ path: join(directory, "uniform-coating-screenshot-settings.png") });
+  await button("Reset"); await ready();
+  const d90 = await page.$('[data-parameter="Bead D90 (assumed)"]');
+  await d90.scrollIntoView(); await d90.hover();
+  await page.waitForSelector('[role="tooltip"]');
+  ensure(await page.evaluate(() => {
+    const tip = document.querySelector('[role="tooltip"]'), box = tip.getBoundingClientRect();
+    return tip.textContent.includes("same bead batch") && /not a second bead type/i.test(tip.textContent) &&
+      tip.parentElement === document.body && box.left >= 0 && box.top >= 0 &&
+      box.right <= innerWidth && box.bottom <= innerHeight;
+  }), "D90 tooltip is missing, misleading, or clipped by the sidebar / viewport");
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector('[role="tooltip"]'));
+  await page.focus('[data-parameter="Area Balance"] input');
+  await page.waitForFunction(() => document.querySelector('[role="tooltip"]')?.textContent.includes("no longer trims"));
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector('[role="tooltip"]'));
+  const electricalReadout = () => page.evaluate(() => {
+    const e = document.querySelector('[data-testid="electrical-estimate"]');
+    return { iscMa: e.dataset.iscMa === "" ? null : Number(e.dataset.iscMa),
+      ftoIscMa: e.dataset.ftoIscMa === "" ? null : Number(e.dataset.ftoIscMa),
+      area: Number(e.dataset.minAreaMm2), cell: Number(e.dataset.limitingCell) };
+  });
+  ensure(original.referenceAreaMm2 === 3025 && original.referenceLightMode === "same-light",
+    "Confirmed 55x55 area and same-reference-light defaults are missing");
+  const referenceElectrical = await electricalReadout();
+  ensure(Math.abs(referenceElectrical.iscMa - 39 * referenceElectrical.area / 3025) < 1e-9 && referenceElectrical.ftoIscMa === null,
+    "Reference scaling is wrong, or unpaired website voltage is silently fitted as an I–V curve");
+  ensure(await page.evaluate(() => document.querySelector('[data-testid="voltage-observation"]')?.textContent.includes("497.10") &&
+    document.querySelector('[data-testid="voltage-observation"]')?.dataset.currentPaired === "false" &&
+    !document.querySelector('[data-parameter="Irradiance"]')),
+    "Online voltage provenance is missing or same-light mode implies a known mW/cm² input");
+  await select("Voltage Observation", "a-2026-10-25");
+  ensure(Math.abs((await electricalReadout()).iscMa - referenceElectrical.iscMa) < 1e-9 &&
+    await page.$eval('[data-testid="voltage-observation"]', (el) => el.textContent.includes("328.63")),
+    "Voltage aging was converted into an unsupported Isc aging factor");
+  await select("Reference Light Mode", "lux-ratio");
+  ensure((await electricalReadout()).iscMa === null, "Online Voc lux was substituted for missing Isc-paired lux");
+  await field("Isc Reference Lux", 1000); await ready();
+  await field("Target Illuminance", 500); await ready();
+  ensure(Math.abs((await electricalReadout()).iscMa - referenceElectrical.iscMa / 2) < 1e-9,
+    "Explicit same-spectrum lux ratio is not applied correctly");
+  await button("Use DSSC 55×55 A reference"); await ready();
+  await page.$eval('[data-parameter="Reference Active Area"]', (el) => el.scrollIntoView());
+  await page.keyboard.press("Escape");
+  await page.screenshot({ path: join(directory, "reference-fto-estimate.png") });
+  const ftoR = () => page.$eval('[data-testid="fto-resistance"]', (el) => Number(el.dataset.totalOhm));
+  const r15 = await ftoR();
+  await select("Bigger FTO Grade", "tec7");
+  ensure((await config()).ftoBiggerOhmSq === 7 && (await config()).ftoSmallerOhmSq === 13 && await ftoR() < r15,
+    "TEC grade does not affect resistance independently on the two plates");
+  await field("Bigger FTO Rs", 9); await ready();
+  ensure((await config()).ftoBiggerPreset === "custom", "Manual sheet resistance still claims a TEC preset");
+  await button("Reset"); await ready();
+  await select("Current Basis", "jsc-input");
+  await select("Voltage Observation", "manual");
+  const baseElectrical = await electricalReadout();
+  await field("Cell Jsc @100", 15); await ready();
+  const jscElectrical = await electricalReadout();
+  ensure(Math.abs(jscElectrical.iscMa - jscElectrical.area / 100 * 15) < 1e-9 &&
+    Math.abs(jscElectrical.iscMa / baseElectrical.iscMa - 1.5) < 1e-9 && jscElectrical.cell > 0,
+    "UI Isc does not use the limiting cell at the entered Jsc");
+  await field("Irradiance", 50); await ready();
+  ensure(Math.abs((await electricalReadout()).iscMa - jscElectrical.iscMa / 2) < 1e-9,
+    "Isc irradiance scaling is incorrect");
+  const lowFtoCurrent = (await electricalReadout()).ftoIscMa;
+  await field("Bigger FTO Rs", 500); await ready();
+  await field("Smaller FTO Rs", 500); await ready();
+  ensure((await electricalReadout()).ftoIscMa < lowFtoCurrent,
+    "FTO resistance is displayed but not connected to the Isc scenario");
+  await button("Reset"); await ready();
+  ensure(original.beadDiameterUm === 15 && original.beadGradeMesh === 1000 && original.screenMeshPerInch === 200, "Bead and screen defaults conflated");
+  await field("Screen Mesh", 140);
+  await field("Wire Diameter", 14);
+  await field("Binding Width", 1);
+  ensure(await page.evaluate(() => document.querySelector(".title-status").dataset.state === "error" &&
+    document.body.textContent.includes("10.83") && document.body.textContent.includes("underfill") &&
+    document.body.textContent.includes("INVALID")), "Screenshot underfill was misreported as zero-spread safety");
+  await button("Binding");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="binding"]'));
+  await page.screenshot({ path: join(directory, "screenshot-settings-underfill.png") });
+  const screenshotAperture = await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="binding-aperture"]');
+    return { printGapMm: Number(el.dataset.printGapMm), filmUm: Number(el.dataset.sizingFilmUm), source: el.dataset.sizingSource };
+  });
+  ensure(screenshotAperture.printGapMm > 1 && screenshotAperture.source === "unmeasured-screen-charge",
+    "Screenshot settings still use the nominal 0.32 transfer to make a tiny aperture");
+  ensure(await page.evaluate(() => document.querySelector('[data-testid="binding-aperture"]').textContent.includes("Actual pressed opening: NOT MEASURED")),
+    "The scenario opening is still presented as a physical measurement");
+   await button("Etch Bigger");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="etch-6066"]') &&
+    document.querySelector('[data-testid="terminal-check"]')?.getAttribute("data-isolated") === "true");
+  ensure(await page.evaluate(() => document.querySelectorAll('.preview-frame #FTO_ETCH_6066 path[data-source="voronoi-bleed"]').length > 0 &&
+    !document.querySelector('.preview-frame path[data-source="active-perimeter"], .preview-frame path[data-source="terminal-isolation"]')),
+    "Voronoi bleed is missing or an etch frame is still present");
+  ensure(await page.evaluate(() => ["left", "right"].every((side) =>
+    document.querySelectorAll(`.preview-frame #FTO_ETCH_6066 path[data-shared-side="${side}"]`).length === 1)),
+    "The marked side regions still have multiple bleed rays");
+  ensure(await page.evaluate(() => {
+    const frame = document.querySelector(".preview-frame"), svg = frame.querySelector("svg");
+    const css = getComputedStyle(frame), a = frame.getBoundingClientRect(), b = svg.getBoundingClientRect();
+    return parseFloat(css.paddingTop) === 0 && parseFloat(css.borderTopWidth) === 0 &&
+      Math.abs(a.width - b.width) < 0.1 && Math.abs(a.height - b.height) < 0.1 &&
+      !svg.querySelector('[fill="#eeeeee"], [fill="#dddddd"]') &&
+      document.querySelector('[data-testid="glass-boundary"]').textContent.includes("NO ETCH FRAME");
+  }), "Preview has an artboard border / inset, or fails to identify the real glass edge");
+  await page.screenshot({ path: join(directory, "etch-6066-strip-isolation.png") });
+   await button("Etch Smaller");
+  await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="etch-6060"]'));
+  ensure(await page.evaluate(() => document.querySelector('.preview-frame svg').getAttribute("viewBox") === "0 0 60 60" &&
+    document.querySelector('[data-testid="glass-boundary"]').textContent.includes("NO ETCH FRAME")),
+    "6060 glass range / full-height routes are unclear");
+  await page.screenshot({ path: join(directory, "etch-6060-glass-edge.png") });
+   await button("Etch Bigger");
+  await field("Measured Wet Film", 20);
+  const recommended = await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.textContent.startsWith("Apply print-size estimate"))?.textContent.trim());
+  await button(recommended); await ready();
+  await field("Electrical Cells", 4); await ready();
+  await field("Print Gap Floor", 2); await ready();
+  ensure(await page.evaluate(() => Number(document.querySelector('[data-testid="binding-aperture"]').dataset.printGapMm) >= 2 - 1e-6),
+    "Requested print-gap floor was silently reduced");
+  ensure((await config()).bindingWidthMm < 0.5, "Submillimetre print-width estimate still has a hidden 1.5 mm target");
+  await field("Bead Grade (linked)", 2000);
+  ensure((await config()).beadDiameterUm === 7.5 && (await config()).beadD90Um === 10, "Bead grade / diameter did not link");
+  await field("Bead D50 / Gap", 15);
+  ensure((await config()).beadGradeMesh === 1000, "Diameter did not update grade in reverse");
+  await page.evaluate((old) => {
+    const legacy = { ...old, bindingWidthMm: 1.5, screenMeshPerInch: 140, screenWireUm: 14,
+      referenceAreaMm2: 0, cellVocV: 0.7, glass6066HeightMm: 64, glass6060HeightMm: 54 };
+    delete legacy.glassHeightMm;
+    delete legacy.referenceVoltageObservation;
+    delete legacy.referenceLightMode;
+    localStorage.setItem("w-series-voronoi-layout-v5", JSON.stringify(legacy));
+    localStorage.removeItem("w-series-voronoi-layout-v6");
+  }, original);
+  await page.reload({ waitUntil: "networkidle2" });
+  await page.waitForSelector(".classic-window");
+  ensure((await config()).bindingWidthMm === 1.5 && (await config()).screenMeshPerInch === 140,
+    "Migration silently replaced manual dimensions");
+  ensure((await config()).glassHeightMm === 64 && !Object.hasOwn(await config(), "glass6066HeightMm") &&
+    !Object.hasOwn(await config(), "glass6060HeightMm"), "Legacy two-height config was not migrated to one shared height");
+  ensure((await config()).referenceAreaMm2 === 3025 && (await config()).referenceLightMode === "same-light" &&
+    (await config()).referenceVoltageObservation === "manual" && (await config()).cellVocV === 0.7,
+    "Legacy reference migration overwrote manual voltage or did not adopt the confirmed unknown-area replacement");
+   ensure(await page.evaluate(() => document.body.textContent.includes("underfill")), "Migrated underfill was not flagged");
+  await button("Reset"); await ready();
+  await field("Screen Mesh", 400);
+  ensure(await page.evaluate(() => document.querySelector(".title-status").dataset.state === "error" && document.querySelector(".warning-stack").textContent.includes("D90")), "Unprintable bead / screen combination was not detected");
+  await button("Reset"); await ready();
+  await field("FTO Etch Width", 7);
+  ensure((await config()).ftoEtchWidthMm === 5, "Etch width does not clamp to 5 mm");
+  await button("Reset"); await ready();
+  await field("Binding Width", 99);
+  ensure((await config()).bindingWidthMm <= 5, "Manual seal width exceeded upper limit");
+  await button("Reset"); await ready();
+  await field("Area Balance", 0); await ready();
+  const unbalancedArea = (await electricalReadout()).area;
+  const unbalancedCv = await page.$eval('[data-testid="active-area"]', (el) => Number(el.dataset.areaCv));
+  await field("Area Balance", 1); await ready();
+  ensure((await electricalReadout()).area > unbalancedArea &&
+    await page.$eval('[data-testid="active-area"]', (el) => Number(el.dataset.areaCv)) < unbalancedCv,
+    "Site-only balancing did not improve the weakest cell and residual area variation");
+  const beforeGap = await page.$eval('[data-testid="coating-clearance"]', (el) => Number(el.dataset.totalActiveMm2));
+  await field("Coating Safety Gap", 0.4); await ready();
+  ensure(await page.$eval('[data-testid="coating-clearance"]', (el) => Number(el.dataset.scenarioMm)) >= 0.49999 &&
+    await page.$eval('[data-testid="coating-clearance"]', (el) => Number(el.dataset.totalActiveMm2)) < beforeGap,
+    "Safety-gap control is not connected to the coating geometry / active-area readout");
+  await button("Reset"); await ready();
+  const download = async (label) => {
+    const before = new Set(await readdir(directory));
+    await button(label);
+    let path;
+    for (let i = 0; i < 300; i++) {
+      path = (await readdir(directory)).find((name) => !before.has(name) && name.endsWith(".zip"));
+      if (path) break;
+      await sleep(100);
     }
+    ensure(path, "ZIP download timed out");
+    await ready();
+    const data = unzipSync(new Uint8Array(await readFile(join(directory, path))));
+    await rm(join(directory, path));
+    return data;
   };
-
-  const waitForNumberCommit = async (label, configKey, expected) => {
-    await page.waitForFunction(
-      (labelText, key, field, value) => {
-        const input = [...document.querySelectorAll("label.form-row")]
-          .find(
-            (row) =>
-              row.querySelector(":scope > span")?.textContent?.trim() === labelText,
-          )
-          ?.querySelector(".number-draft");
-        const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-        return (
-          input instanceof HTMLInputElement &&
-          Number(input.value) === value &&
-          stored?.[field] === value &&
-          document.querySelector(".title-status")?.textContent?.trim() === "DRC pass" &&
-          !document.querySelector(".preview-frame.pending")
-        );
-      },
-      { timeout: 30_000 },
-      label,
-      storageKey,
-      configKey,
-      expected,
-    );
-  };
-
-  const initial = await page.evaluate(
-    (keys, key, removed) => {
-      const textarea = document.querySelector(".point-code-field textarea");
-      const tabs = [...document.querySelectorAll(".view-toolbar > button")].map(
-        (button) => button.textContent?.trim() ?? "",
-      );
-      const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-      return {
-        tabs,
-        bodyText: document.body.textContent ?? "",
-        stored,
-        legacyValues: Object.fromEntries(
-          keys.filter((candidate) => candidate !== key).map((candidate) => [
-            candidate,
-            localStorage.getItem(candidate),
-          ]),
-        ),
-        localStorageKeys: Object.keys(localStorage).sort(),
-        sequenceCards: document.querySelectorAll(".sequence-cell").length,
-        removedPresent: removed.filter((field) =>
-          Object.prototype.hasOwnProperty.call(stored ?? {}, field),
-        ),
-        textarea:
-          textarea instanceof HTMLTextAreaElement
-            ? {
-                count: document.querySelectorAll(".point-code-field textarea").length,
-                rows: textarea.rows,
-                fontSizePx: Number.parseFloat(getComputedStyle(textarea).fontSize),
-                value: textarea.value,
-              }
-            : null,
-      };
-    },
-    relevantStorageKeys,
-    storageKey,
-    removedConfigKeys,
-  );
-  sameArray(initial.tabs, viewLabels, "Preview tabs are stale");
-  ensure(initial.tabs.length === 7, `Expected exactly 7 tabs, received ${initial.tabs.length}.`);
-  ensure(!initial.tabs.includes("Font Voronoi"), "Removed Font Voronoi tab is present.");
-  ensure(
-    !/normalized[\s-]*slot/i.test(initial.bodyText),
-    "Removed normalized-slot diagnostics are present.",
-  );
-  ensure(initial.sequenceCards === 0, "Removed per-cell text allocation cards are present.");
-  ensure(
-    Object.values(initial.legacyValues).every((value) => value === null),
-    `Legacy storage was not cleared: ${JSON.stringify(initial.legacyValues)}.`,
-  );
-  sameArray(initial.localStorageKeys, [storageKey], "Unexpected localStorage keys after clear");
-  sameArray(Object.keys(initial.stored).sort(), configKeys, "Stored v4 config fields are stale");
-  sameArray(initial.removedPresent, [], "Removed config fields remain in localStorage");
-  ensure(
-    initial.textarea?.count === 1 &&
-      initial.textarea.rows >= 3 &&
-      initial.textarea.fontSizePx >= 14 &&
-      initial.textarea.value === defaultText,
-    `Point Code Text textarea is not usable: ${JSON.stringify(initial.textarea)}.`,
-  );
-
-  const draftBaseline = await page.evaluate((key) => ({
-    persisted: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-    svg: document.querySelector(".preview-frame svg")?.outerHTML ?? "",
-    status: document.querySelector(".title-status")?.textContent?.trim() ?? "",
-  }), storageKey);
-  ensure(draftBaseline.persisted === 0.34, "Fresh Cell Jitter default is not 0.34.");
-
-  await focusNumberField("Cell Jitter");
-  await page.keyboard.press("Backspace");
-  await sleep(80);
-  const clearedDraft = await page.evaluate((key) => {
-    const input = [...document.querySelectorAll("label.form-row")]
-      .find(
-        (row) =>
-          row.querySelector(":scope > span")?.textContent?.trim() === "Cell Jitter",
-      )
-      ?.querySelector(".number-draft");
-    return {
-      value: input instanceof HTMLInputElement ? input.value : null,
-      persisted: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-      svg: document.querySelector(".preview-frame svg")?.outerHTML ?? "",
-      status: document.querySelector(".title-status")?.textContent?.trim() ?? "",
-    };
-  }, storageKey);
-  ensure(
-    clearedDraft.value === "" &&
-      clearedDraft.persisted === draftBaseline.persisted &&
-      clearedDraft.svg === draftBaseline.svg &&
-      clearedDraft.status === "DRC pass",
-    "Clearing Cell Jitter committed or regenerated the design immediately.",
-  );
-
-  await page.keyboard.type(".");
-  await sleep(80);
-  const decimalDraft = await page.evaluate((key) => {
-    const input = [...document.querySelectorAll("label.form-row")]
-      .find(
-        (row) =>
-          row.querySelector(":scope > span")?.textContent?.trim() === "Cell Jitter",
-      )
-      ?.querySelector(".number-draft");
-    return {
-      value: input instanceof HTMLInputElement ? input.value : null,
-      persisted: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-      svg: document.querySelector(".preview-frame svg")?.outerHTML ?? "",
-    };
-  }, storageKey);
-  ensure(
-    decimalDraft.value === "." &&
-      decimalDraft.persisted === draftBaseline.persisted &&
-      decimalDraft.svg === draftBaseline.svg,
-    "Intermediate decimal Cell Jitter draft committed or regenerated immediately.",
-  );
-  await page.keyboard.type("5");
-  await sleep(80);
-  const fractionalDraft = await page.evaluate((key) => {
-    const input = [...document.querySelectorAll("label.form-row")]
-      .find(
-        (row) =>
-          row.querySelector(":scope > span")?.textContent?.trim() === "Cell Jitter",
-      )
-      ?.querySelector(".number-draft");
-    return {
-      value: input instanceof HTMLInputElement ? input.value : null,
-      persisted: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-      svg: document.querySelector(".preview-frame svg")?.outerHTML ?? "",
-    };
-  }, storageKey);
-  ensure(
-    fractionalDraft.value === ".5" &&
-      fractionalDraft.persisted === draftBaseline.persisted &&
-      fractionalDraft.svg === draftBaseline.svg,
-    "Fractional Cell Jitter draft committed or regenerated immediately.",
-  );
-
-  await setNumberField("Cell Jitter", "1.37", "enter");
-  await waitForNumberCommit("Cell Jitter", "electrodeJitter", 1.37);
-  const arbitraryCommit = await page.evaluate((key) => ({
-    value: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-    status: document.querySelector(".title-status")?.textContent?.trim(),
-  }), storageKey);
-
-  await setNumberField("Cell Jitter", "2", "blur");
-  await waitForNumberCommit("Cell Jitter", "electrodeJitter", 2);
-  await page.reload({ waitUntil: "networkidle2", timeout: 30_000 });
-  await page.waitForSelector(".classic-window", { timeout: 30_000 });
-  await waitForReady();
-  await waitForNumberCommit("Cell Jitter", "electrodeJitter", 2);
-  const jitterPersistence = await page.evaluate((key) => ({
-    value: JSON.parse(localStorage.getItem(key) ?? "null")?.electrodeJitter,
-    status: document.querySelector(".title-status")?.textContent?.trim(),
-  }), storageKey);
-  ensure(
-    jitterPersistence.value === 2 && jitterPersistence.status === "DRC pass",
-    "Cell Jitter 2 did not persist across reload with a DRC pass.",
-  );
-
-  await clickButton("Reset");
-  await page.waitForFunction(
-    (key, phrase) => {
-      const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-      return (
-        stored?.subcellCount === 16 &&
-        stored?.electrodeJitter === 0.34 &&
-        stored?.ftoEtchWidthMm === 0.08 &&
-        stored?.bindingWidthMm === 3 &&
-        stored?.text === phrase &&
-        document.querySelector(".title-status")?.textContent?.trim() === "DRC pass" &&
-        !document.querySelector(".preview-frame.pending")
-      );
-    },
-    { timeout: 30_000 },
-    storageKey,
-    defaultText,
-  );
-
-  await setNumberField("Electrical Cells", "64", "enter");
-  await page.waitForFunction(
-    (key) => JSON.parse(localStorage.getItem(key) ?? "null")?.subcellCount === 64,
-    { timeout: 30_000 },
-    storageKey,
-  );
-  await setNumberField("Binding Width", "5", "blur");
-  await page.waitForFunction(
-    (key) => {
-      const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-      const complete = [...document.querySelectorAll("button")].find(
-        (button) => button.textContent?.trim() === "Complete ZIP: PDF + 1-bit TIFF",
-      );
-      const saveView = [...document.querySelectorAll("button")].find(
-        (button) => button.textContent?.trim() === "Save View SVG",
-      );
-      return (
-        stored?.subcellCount === 64 &&
-        stored?.bindingWidthMm === 5 &&
-        document.querySelector(".title-status")?.textContent?.trim() === "DRC error" &&
-        !document.querySelector(".preview-frame.pending") &&
-        complete instanceof HTMLButtonElement &&
-        complete.disabled &&
-        saveView instanceof HTMLButtonElement &&
-        saveView.disabled &&
-        /Screen cell/.test(document.querySelector(".warning-stack")?.textContent ?? "")
-      );
-    },
-    { timeout: 30_000 },
-    storageKey,
-  );
-  const denseLayoutBlocked = true;
-
-  await clickButton("Reset");
-  await page.waitForFunction(
-    (key, phrase) => {
-      const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-      return (
-        stored?.subcellCount === 16 &&
-        stored?.bindingWidthMm === 3 &&
-        stored?.text === phrase &&
-        document.querySelector(".title-status")?.textContent?.trim() === "DRC pass" &&
-        !document.querySelector(".preview-frame.pending")
-      );
-    },
-    { timeout: 30_000 },
-    storageKey,
-    defaultText,
-  );
-  await setNumberField("Electrical Cells", "4", "enter");
-  await waitForNumberCommit("Electrical Cells", "subcellCount", 4);
-
-  const setup = await page.evaluate((key) => {
-    const valueFor = (labelText) => {
-      const input = [...document.querySelectorAll("label.form-row")]
-        .find(
-          (row) =>
-            row.querySelector(":scope > span")?.textContent?.trim() === labelText,
-        )
-        ?.querySelector(".number-draft");
-      return input instanceof HTMLInputElement ? input.value : "";
-    };
-    const textarea = document.querySelector(".point-code-field textarea");
-    return {
-      storedConfig: JSON.parse(localStorage.getItem(key) ?? "null"),
-      status: document.querySelector(".title-status")?.textContent?.trim(),
-      electricalCells: Number(valueFor("Electrical Cells")),
-      bindingWidthMm: Number(valueFor("Binding Width")),
-      ftoEtchWidthMm: Number(valueFor("FTO Etch Width")),
-      text: textarea instanceof HTMLTextAreaElement ? textarea.value : "",
-    };
-  }, storageKey);
-  ensure(setup.status === "DRC pass", `Unexpected DRC state ${String(setup.status)}.`);
-  ensure(setup.electricalCells === 4, "Electrical Cells did not commit to 4.");
-  ensure(setup.bindingWidthMm === 3, "Binding Width did not reset to 3 mm.");
-  ensure(setup.ftoEtchWidthMm === 0.08, "FTO Etch Width did not reset to 0.08 mm.");
-  ensure(setup.text === defaultText, "Default Point Code Text was not retained.");
-  sameArray(Object.keys(setup.storedConfig).sort(), configKeys, "Stored fixture config is stale");
-
-  const cameraState = async () =>
-    page.evaluate(() => ({
-      transform: document.querySelector(".preview-camera")?.style.transform ?? "",
-      readout: document.querySelector(".zoom-readout output")?.textContent?.trim() ?? "",
-      scrollY: window.scrollY,
-      wheelPrevented: Boolean(window.__smokeWheelPrevented),
-    }));
-  const cameraValues = (transform) => {
-    const match = transform.match(
-      /^translate\(([-+\d.eE]+)px, ([-+\d.eE]+)px\) scale\(([-+\d.eE]+)\)$/,
-    );
-    ensure(match, `Unexpected preview camera transform "${transform}".`);
-    return { x: Number(match[1]), y: Number(match[2]), scale: Number(match[3]) };
-  };
-  const workspaceCenter = async () =>
-    page.evaluate(() => {
-      const bounds = document.querySelector(".preview-workspace")?.getBoundingClientRect();
-      return bounds
-        ? { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }
-        : null;
-    });
-
-  const cameraInitial = await cameraState();
-  ensure(
-    cameraInitial.readout === "100%" &&
-      cameraInitial.transform === "translate(0px, 0px) scale(1)",
-    `Preview camera did not start fitted: ${JSON.stringify(cameraInitial)}.`,
-  );
-  await page.evaluate(() => {
-    document.body.style.minHeight = "calc(100vh + 240px)";
-    window.scrollTo(0, 120);
-    window.__smokeWheelPrevented = false;
-    document.querySelector(".preview-workspace")?.addEventListener(
-      "wheel",
-      (event) => {
-        window.__smokeWheelPrevented = event.defaultPrevented;
-      },
-      { once: true },
-    );
-  });
-  await page.waitForFunction(() => window.scrollY > 0, { timeout: 10_000 });
-  const scrollBeforeWheel = await page.evaluate(() => window.scrollY);
-  const wheelCenter = await workspaceCenter();
-  ensure(wheelCenter, "Preview workspace bounds are unavailable for wheel testing.");
-  await page.mouse.move(wheelCenter.x, wheelCenter.y);
-  await page.mouse.wheel({ deltaY: -240 });
-  await page.waitForFunction(
-    () => Number.parseInt(document.querySelector(".zoom-readout output")?.textContent ?? "0", 10) > 100,
-    { timeout: 10_000 },
-  );
-  const cameraZoomed = await cameraState();
-  const zoomValues = cameraValues(cameraZoomed.transform);
-  ensure(
-    zoomValues.scale > 1 &&
-      Number.parseInt(cameraZoomed.readout, 10) > 100 &&
-      cameraZoomed.transform !== cameraInitial.transform &&
-      cameraZoomed.wheelPrevented &&
-      cameraZoomed.scrollY === scrollBeforeWheel,
-    `Wheel zoom did not increase scale without page scrolling: ${JSON.stringify(cameraZoomed)}.`,
-  );
-  await page.evaluate(() => {
-    document.body.style.minHeight = "";
-    window.scrollTo(0, 0);
-  });
-
-  const panStart = cameraValues(cameraZoomed.transform);
-  const panCenter = await workspaceCenter();
-  ensure(panCenter, "Preview workspace bounds are unavailable for pan testing.");
-  await page.mouse.move(panCenter.x - 40, panCenter.y - 20);
-  await page.mouse.down({ button: "left" });
-  await page.mouse.move(panCenter.x + 45, panCenter.y + 35, { steps: 5 });
-  await page.mouse.up({ button: "left" });
-  await page.waitForFunction(
-    (previous) => document.querySelector(".preview-camera")?.style.transform !== previous,
-    { timeout: 10_000 },
-    cameraZoomed.transform,
-  );
-  const cameraPanned = await cameraState();
-  const panValues = cameraValues(cameraPanned.transform);
-  ensure(
-    panValues.x !== panStart.x || panValues.y !== panStart.y,
-    `Left pointer drag did not translate the camera: ${JSON.stringify(cameraPanned)}.`,
-  );
-
-  await clickButton("Fit");
-  await page.waitForFunction(
-    () =>
-      document.querySelector(".zoom-readout output")?.textContent?.trim() === "100%" &&
-      document.querySelector(".preview-camera")?.style.transform ===
-        "translate(0px, 0px) scale(1)",
-    { timeout: 10_000 },
-  );
-  const cameraFit = await cameraState();
-  const secondCenter = await workspaceCenter();
-  ensure(secondCenter, "Preview workspace bounds are unavailable for tab reset testing.");
-  await page.mouse.move(secondCenter.x, secondCenter.y);
-  await page.mouse.wheel({ deltaY: -180 });
-  await page.waitForFunction(
-    () => Number.parseInt(document.querySelector(".zoom-readout output")?.textContent ?? "0", 10) > 100,
-    { timeout: 10_000 },
-  );
-  await selectView("Circuit", "circuit");
-  await page.waitForFunction(
-    () =>
-      document.querySelector(".zoom-readout output")?.textContent?.trim() === "100%" &&
-      document.querySelector(".preview-camera")?.style.transform ===
-        "translate(0px, 0px) scale(1)",
-    { timeout: 10_000 },
-  );
-  const cameraTabReset = await cameraState();
-
-  const numericSummary = {
-    drafts: [clearedDraft.value, decimalDraft.value, fractionalDraft.value],
-    enterCommit: arbitraryCommit.value,
-    persistedJitter: jitterPersistence.value,
-    denseLayoutBlocked,
-    fixtureCells: setup.electricalCells,
-  };
-
-  await selectView("Final Assembly", "assembly");
-  const assembly = await page.evaluate(() => {
-    const svg = document.querySelector('.preview-frame svg[data-view="assembly"]');
-    if (!(svg instanceof SVGSVGElement)) return null;
-    const cells = [
-      ...svg.querySelectorAll("#ASSEMBLY_CIRCUIT_MATERIAL_CELLS > path"),
-    ];
-    const source = svg.outerHTML;
-    return {
-      cells: cells.length,
-      indexes: cells.map((path) => path.getAttribute("data-subcell-index")),
-      materials: cells.map((path) => path.getAttribute("data-material")),
-      fills: [...new Set(cells.map((path) => path.getAttribute("fill")))],
-      text: svg.querySelectorAll("text").length,
-      circles: svg.querySelectorAll("circle").length,
-      strokes: svg.querySelectorAll("[stroke-width]").length,
-      forbidden:
-        /POINT_CODE|ELECTRON_(?:PATH|ROUTE)|GUIDES_NON_PRINTING|FTO_ETCH|BINDING_MASK|FONT_|fontArtwork|glyph|microcell/i.test(
-          source,
-        ),
-      colors: [...new Set(
-        source.match(/#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?![0-9a-f])/gi) ??
-          [],
-      )].sort(),
-    };
-  });
-  ensure(assembly, "Final Assembly SVG was not found.");
-  ensure(assembly.cells === 4, `Final Assembly has ${assembly.cells} material cells.`);
-  sameArray(assembly.indexes, ["0", "1", "2", "3"], "Final Assembly cell indexes are wrong");
-  sameArray(assembly.materials, ["tio2", "pt", "tio2", "pt"], "Final Assembly material parity is wrong");
-  ensure(assembly.fills.length === 2, `Final Assembly has ${assembly.fills.length} material fills.`);
-  ensure(
-    !assembly.forbidden &&
-      assembly.text === 0 &&
-      assembly.circles === 0 &&
-      assembly.strokes === 0,
-    "Final Assembly contains point, route, guide, removed font, annotation, or stroke data.",
-  );
-  ensureGrayscale(assembly.colors, "Final Assembly SVG");
-
-  await selectView("Circuit", "circuit");
-  const circuit = await page.evaluate(() => {
-    const svg = document.querySelector('.preview-frame svg[data-view="circuit"]');
-    if (!(svg instanceof SVGSVGElement)) return null;
-    const plate = (suffix) => {
-      const panel = svg.querySelector(`#CIRCUIT_PLATE_${suffix}`);
-      const cells = [...svg.querySelectorAll(`#CIRCUIT_${suffix}_MATERIAL_CELLS > path`)];
-      const labels = [...svg.querySelectorAll(`#CIRCUIT_${suffix}_ORDER_LABELS > text`)];
-      const route = svg.querySelector(`#ELECTRON_ROUTE_${suffix}`);
-      const outline = panel?.querySelector(`#CIRCUIT_${suffix}_PLATE_OUTLINE`);
-      return {
-        present: panel instanceof SVGGElement,
-        mirrored: panel?.getAttribute("data-mirrored"),
-        outline: outline
-          ? {
-              x: Number(outline.getAttribute("x")),
-              y: Number(outline.getAttribute("y")),
-              width: Number(outline.getAttribute("width")),
-              height: Number(outline.getAttribute("height")),
-            }
-          : null,
-        cellOrders: cells.map((path) => path.getAttribute("data-electron-order")),
-        cellIndexes: cells.map((path) => path.getAttribute("data-subcell-index")),
-        materials: cells.map((path) => path.getAttribute("data-material")),
-        labels: labels.map((label) => label.textContent?.trim()),
-        routeStroke: route?.getAttribute("stroke-width"),
-        routePaths: route?.querySelectorAll(":scope > path").length ?? 0,
-        routeFill: route?.getAttribute("fill"),
-      };
-    };
-    const contacts = [...svg.querySelectorAll("#CIRCUIT_6066_CONTACT_STRIPS > rect")];
-    const source = svg.outerHTML;
-    const strokeWidths = [...svg.querySelectorAll("[stroke-width]")].map((element) =>
-      Number(element.getAttribute("stroke-width")),
-    );
-    return {
-      width: svg.getAttribute("width"),
-      height: svg.getAttribute("height"),
-      viewBox: svg.getAttribute("viewBox"),
-      plate6066: plate("6066"),
-      plate6060: plate("6060"),
-      contactRects: contacts.map((rect) => ({
-        x: Number(rect.getAttribute("x")),
-        y: Number(rect.getAttribute("y")),
-        width: Number(rect.getAttribute("width")),
-        height: Number(rect.getAttribute("height")),
-      })),
-      contactHeights: contacts.map((rect) => Number(rect.getAttribute("height"))),
-      contactPolarities: contacts.map((rect) => rect.getAttribute("data-polarity")),
-      strokeWidths,
-      dashed: /stroke-dasharray/i.test(source),
-      circles: svg.querySelectorAll("circle").length,
-      forbidden:
-        /FONT_|fontArtwork|font-voronoi|microcell|glyph|POINT_CODE|data-slot|data-site/i.test(
-          source,
-        ),
-    };
-  });
-  ensure(circuit, "Circuit SVG was not found.");
-  ensure(
-    circuit.width === "134mm" && circuit.height === "60mm" && circuit.viewBox === "0 0 134 60",
-    `Circuit root is not the default 134 x 60 mm: ${JSON.stringify(circuit)}.`,
-  );
-  for (const [suffix, plate] of [
-    ["6066", circuit.plate6066],
-    ["6060", circuit.plate6060],
-  ]) {
-    ensure(plate.present, `CIRCUIT_PLATE_${suffix} is missing.`);
-    sameArray(plate.cellIndexes, ["0", "1", "2", "3"], `Circuit ${suffix} cell order is wrong`);
-    sameArray(plate.cellOrders, ["1", "2", "3", "4"], `Circuit ${suffix} electron order is wrong`);
-    sameArray(plate.labels, ["1", "2", "3", "4"], `Circuit ${suffix} labels are wrong`);
-    sameArray(
-      plate.materials,
-      suffix === "6066" ? ["tio2", "pt", "tio2", "pt"] : ["pt", "tio2", "pt", "tio2"],
-      `Circuit ${suffix} material parity is wrong`,
-    );
-    ensure(
-      plate.routeStroke === "0.1" && plate.routePaths === 1 && plate.routeFill === "none",
-      `ELECTRON_ROUTE_${suffix} is not one solid 0.1 mm path.`,
-    );
+  const referenceVector = await download("Export Vector ZIP");
+  await page.click('[data-testid="language-zh-TW"]');
+  await page.waitForFunction(() => document.documentElement.lang === "zh-TW");
+  const chineseVector = await download("匯出向量 ZIP");
+  ensure(Object.keys(referenceVector).length === Object.keys(chineseVector).length &&
+    Object.entries(referenceVector).every(([name, data]) => chineseVector[name] && strFromU8(data) === strFromU8(chineseVector[name])),
+    "Language selection changed design data or fabrication/reference file contents");
+  await page.click('[data-testid="language-en"]'); await ready();
+  const publishedReference = JSON.parse(strFromU8(referenceVector["process-estimates.json"])).electrical;
+  ensure(publishedReference.voltageObservation.sampleId === "green_proofs_are_not_always_about_tax_write-offs_1" &&
+    publishedReference.calibration.referenceAreaMm2 === 3025 && publishedReference.effectiveJscMaCm2 === null &&
+    publishedReference.calibration.referenceIrradianceMwCm2 === null && publishedReference.scenario === null &&
+    Math.abs(publishedReference.iscMa - publishedReference.minimumAreaMm2 / 3025 * 39) < 1e-9,
+    "Export does not preserve A's voltage-only provenance and unknown absolute irradiance");
+  await select("Current Basis", "jsc-input");
+  await select("Voltage Observation", "manual");
+  const vector = await download("Export Vector ZIP");
+  ensure(strFromU8(referenceVector["svg-production/binding-mask.svg"]) === strFromU8(vector["svg-production/binding-mask.svg"]),
+    "Electrical reference / voltage observation changed the production seal geometry");
+  ensure(Object.keys(vector).length === 20, "Vector bundle count differs from 20");
+  const project = JSON.parse(strFromU8(vector["design.json"]));
+  const f = project.geometry.fabrication;
+  ensure(f.coatingClearance.method === "parallel-wall-offset-no-trimming" &&
+    f.coatingClearance.perCell.every((r) => r.printedMm >= f.coatingClearance.printedRequiredMm - 0.00001 &&
+      r.scenarioMm >= f.coatingClearance.scenarioRequiredMm - 0.00001),
+    "Exported coating polygons do not preserve the shared glue clearance");
+  ensure(project.format === "w-series-dssc-project-v9" && f.errors.length === 0 &&
+    project.config.glassHeightMm === project.geometry.glass6066.height && project.config.glassHeightMm === project.geometry.glass6060.height,
+    "Exported project does not use the v9 shared-height model");
+  ensure(project.zebraContactReference.length === 2 && project.zebraContactReference.every((r) => Math.abs(r.areaMm2 - 180) < 1e-6) &&
+    strFromU8(vector["svg-layered/assembly-preview.svg"]).includes("ASSEMBLY_ZEBRA_CONTACTS") &&
+    !Object.keys(vector).filter((p) => p.startsWith("svg-production/")).some((p) => strFromU8(vector[p]).includes("ASSEMBLY_ZEBRA_CONTACTS")),
+    "Zebra contact references are missing from Assembly or leaked into production artwork");
+  ensure(f.compressionValid && f.volumeSpreadMm < 0.01 && f.openingScenario.volumeSpreadMm > f.volumeSpreadMm,
+    "Nominal film and unmeasured stress scenario are not distinguished");
+  ensure(f.ports.every((p) => p.finalWidthMm >= project.config.minimumOpenMm - 0.002), "Actual compressed channel fell below requested width");
+  ensure(project.config.bindingWidthMm < 0.5 && project.config.beadDiameterUm === 15, "Default planar and thickness dimensions are wrong");
+  ensure(Object.values(f.terminalCheck).every(Boolean), "Whole-plate terminal connectivity check failed");
+  ensure(f.ports.length > 0 && f.totalActiveMm2 > 0, "No real fill slots / active area");
+  ensure(strFromU8(vector["manufacturing-layout.dxf"]).includes("AcDbHatch"), "DXF has no opened seal hatches");
+  for (const suffix of ["6066", "6060"]) {
+    const etch = strFromU8(vector[`svg-production/fto-etch-glass-${suffix}.svg`]);
+    ensure(!/GUIDES_NON_PRINTING|<text/.test(etch), "Non-printing outlines leaked into production etch");
+    ensure((etch.match(/data-source="voronoi-bleed"/g) ?? []).length > 0 &&
+      !/data-source="active-perimeter"|data-source="terminal-isolation"|data-source="contact-strip-isolation"/.test(etch), "Etch has no bleed or still contains a frame");
+    const screen = strFromU8(vector[`svg-production/screen-glass-${suffix}-tio2.svg`]);
+    ensure(!/<circle/.test(screen), "Removed point code produced screen holes");
+    ensure(vector[`laser-fill/glass-${suffix}-fill.svg`], "Missing laser fill SVG");
   }
-  ensure(
-    isDeepStrictEqual(circuit.plate6066.outline, { x: 0, y: 0, width: 66, height: 60 }) &&
-      isDeepStrictEqual(circuit.plate6060.outline, { x: 74, y: 0, width: 60, height: 60 }) &&
-      circuit.plate6060.mirrored === "true",
-    `Circuit plate sizing or 6060 mirror is incorrect: ${JSON.stringify(circuit)}.`,
-  );
-  sameArray(circuit.contactPolarities, ["negative", "positive"], "6066 contact order is wrong");
-  ensure(
-    circuit.contactHeights.length === 2 &&
-      circuit.contactHeights.every((height) => height === 60) &&
-      circuit.contactRects.every(({ y, width }) => y === 0 && width > 0),
-    "Circuit does not contain two full-height 60 mm 6066 contact strips.",
-  );
-  ensure(
-    circuit.strokeWidths.filter((width) => width === 0.1).length === 2 &&
-      circuit.strokeWidths
-        .filter((width) => width !== 0.1)
-        .every((width) => Number.isFinite(width) && width <= 0.06) &&
-      !circuit.dashed &&
-      circuit.circles === 0 &&
-      !circuit.forbidden,
-    "Circuit drafting strokes, route solidity, or removed point/font data are incorrect.",
-  );
-
-  const setPointCodeText = async (value) => {
-    const focused = await page.evaluate(() => {
-      const textarea = document.querySelector(".point-code-field textarea");
-      if (!(textarea instanceof HTMLTextAreaElement)) return false;
-      textarea.focus();
-      textarea.select();
-      return document.activeElement === textarea;
-    });
-    ensure(focused, "Unable to focus Point Code Text textarea.");
-    await page.keyboard.type(value);
-    await page.waitForFunction(
-      (key, expected) => {
-        const textarea = document.querySelector(".point-code-field textarea");
-        const stored = JSON.parse(localStorage.getItem(key) ?? "null");
-        return (
-          textarea instanceof HTMLTextAreaElement &&
-          textarea.value === expected &&
-          stored?.text === expected &&
-          document.querySelector(".title-status")?.textContent?.trim() === "DRC pass" &&
-          !document.querySelector(".preview-frame.pending")
-        );
-      },
-      { timeout: 30_000 },
-      storageKey,
-      value,
-    );
-  };
-
-  const inspectScreen = async (label, view, suffix) => {
-    await selectView(label, view);
-    return page.evaluate(
-      (expectedView, expectedSuffix) => {
-        const svg = document.querySelector(`.preview-frame svg[data-view="${expectedView}"]`);
-        if (!(svg instanceof SVGSVGElement)) return null;
-        const pageRect = svg.querySelector(":scope > #SCREEN_PAGE_WHITE");
-        const regionsGroup = svg.querySelector(
-          `:scope > #SCREEN_${expectedSuffix}_TIO2_REGIONS`,
-        );
-        const knockoutGroup = svg.querySelector(":scope > #SCREEN_POINT_CODE_KNOCKOUTS");
-        const paths = regionsGroup
-          ? [...regionsGroup.querySelectorAll(":scope > path")]
-          : [];
-        const circles = knockoutGroup
-          ? [...knockoutGroup.querySelectorAll(":scope > circle")]
-          : [];
-        const inheritedAttribute = (element, name) => {
-          for (let current = element; current && current !== svg; current = current.parentElement) {
-            const value = current.getAttribute(name);
-            if (value !== null) return value;
-          }
-          return null;
-        };
-        const source = svg.outerHTML;
-        return {
-          mirrored: svg.getAttribute("data-mirrored"),
-          graphicalChildren: [...svg.children]
-            .filter((child) => !["title", "metadata"].includes(child.localName))
-            .map((child) => `${child.localName}#${child.id}`),
-          pageFill: pageRect?.getAttribute("fill"),
-          regionFill: regionsGroup?.getAttribute("fill"),
-          knockoutFill: knockoutGroup?.getAttribute("fill"),
-          regionIds: paths.map((path) => path.getAttribute("data-region-id")),
-          regionIndexes: paths.map((path) => path.getAttribute("data-subcell-index")),
-          regionMaterials: paths.map((path) => path.getAttribute("data-material")),
-          regionDs: paths.map((path) => path.getAttribute("d") ?? ""),
-          regionEffectiveFills: paths.map((path) => inheritedAttribute(path, "fill")),
-          regionChildrenOnly:
-            regionsGroup !== null &&
-            [...regionsGroup.children].every((child) => child.localName === "path"),
-          circles: circles.map((circle) => ({
-            id: circle.getAttribute("id"),
-            regionId: circle.getAttribute("data-region-id"),
-            subcellIndex: circle.getAttribute("data-subcell-index"),
-            slotIndex: circle.getAttribute("data-slot-index"),
-            siteIndex: circle.getAttribute("data-site-index"),
-            cx: circle.getAttribute("cx"),
-            cy: circle.getAttribute("cy"),
-            r: circle.getAttribute("r"),
-            fill: inheritedAttribute(circle, "fill"),
-          })),
-          circleChildrenOnly:
-            knockoutGroup !== null &&
-            [...knockoutGroup.children].every((child) => child.localName === "circle"),
-          textCount: svg.querySelectorAll("text").length,
-          hasStroke: /\sstroke(?:-[\w-]+)?=/i.test(source),
-          removedData: /FONT_|fontArtwork|font-voronoi|glyph|microcell/i.test(source),
-          colors: [...new Set(
-            source.match(/#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?![0-9a-f])/gi) ??
-              [],
-          )]
-            .map((color) => color.toLowerCase())
-            .sort(),
-        };
-      },
-      view,
-      suffix,
-    );
-  };
-
-  const validateScreen = (screen, suffix, indexes, mirrored) => {
-    ensure(screen, `Screen ${suffix} SVG was not found.`);
-    sameArray(
-      screen.graphicalChildren,
-      [
-        "rect#SCREEN_PAGE_WHITE",
-        `g#SCREEN_${suffix}_TIO2_REGIONS`,
-        "g#SCREEN_POINT_CODE_KNOCKOUTS",
-      ],
-      `Screen ${suffix} has extra graphical operations`,
-    );
-    sameArray(screen.regionIndexes, indexes.map(String), `Screen ${suffix} TiO2 parity is wrong`);
-    sameArray(
-      screen.regionIds,
-      indexes.map((index) => `screen-${suffix}-cell-${index}`),
-      `Screen ${suffix} region IDs are wrong`,
-    );
-    ensure(
-      screen.pageFill === "#ffffff" &&
-        screen.regionFill === "#000000" &&
-        screen.knockoutFill === "#ffffff" &&
-        screen.regionMaterials.every((material) => material === "tio2") &&
-        screen.regionEffectiveFills.every((fill) => fill === "#000000") &&
-        screen.regionChildrenOnly &&
-        screen.circleChildrenOnly &&
-        screen.mirrored === String(mirrored),
-      `Screen ${suffix} does not contain clean top-level TiO2 masks and point knockouts.`,
-    );
-    const circleIds = screen.circles.map(({ id }) => id);
-    ensure(
-      screen.circles.length > 0 &&
-        new Set(circleIds).size === circleIds.length &&
-        screen.circles.every(
-          ({ id, regionId, subcellIndex, r, fill }) =>
-            id === regionId &&
-            /^cell-\d+-slot-\d+-site-\d+$/.test(id ?? "") &&
-            indexes.includes(Number(subcellIndex)) &&
-            r === "0.03" &&
-            fill === "#ffffff",
-        ),
-      `Screen ${suffix} point knockout IDs, parity, radius, fill, or uniqueness are wrong.`,
-    );
-    ensure(
-      screen.textCount === 0 &&
-        !screen.hasStroke &&
-        !screen.removedData,
-      `Screen ${suffix} contains text, strokes, or removed glyph/microcell data.`,
-    );
-    sameArray(screen.colors, ["#000000", "#ffffff"], `Screen ${suffix} is not binary black/white`);
-  };
-
-  const screen6066 = await inspectScreen("Screen 6066", "glass-6066", "6066");
-  const screen6060 = await inspectScreen("Screen 6060", "glass-6060", "6060");
-  validateScreen(screen6066, "6066", [0, 2], false);
-  validateScreen(screen6060, "6060", [1, 3], true);
-
-  await setPointCodeText(replacementText);
-  const replacement6066 = await inspectScreen("Screen 6066", "glass-6066", "6066");
-  const replacement6060 = await inspectScreen("Screen 6060", "glass-6060", "6060");
-  for (const [suffix, baseline, replacement] of [
-    ["6066", screen6066, replacement6066],
-    ["6060", screen6060, replacement6060],
-  ]) {
-    sameArray(replacement.regionDs, baseline.regionDs, `Screen ${suffix} regions changed with text`);
-    ensure(
-      !isDeepStrictEqual(replacement.circles, baseline.circles),
-      `Screen ${suffix} point circles did not change with text.`,
-    );
-  }
-
-  await setPointCodeText(spacesText);
-  const spaces6066 = await inspectScreen("Screen 6066", "glass-6066", "6066");
-  const spaces6060 = await inspectScreen("Screen 6060", "glass-6060", "6060");
-  for (const [suffix, baseline, spaces] of [
-    ["6066", screen6066, spaces6066],
-    ["6060", screen6060, spaces6060],
-  ]) {
-    sameArray(spaces.regionDs, baseline.regionDs, `Screen ${suffix} regions changed for spaces`);
-    ensure(spaces.circles.length === 0, `Screen ${suffix} has point circles for all-space text.`);
-  }
-
-  await setPointCodeText(defaultText);
-  const restored6066 = await inspectScreen("Screen 6066", "glass-6066", "6066");
-  const restored6060 = await inspectScreen("Screen 6060", "glass-6060", "6060");
-  ensure(
-    isDeepStrictEqual(restored6066.circles, screen6066.circles) &&
-      isDeepStrictEqual(restored6060.circles, screen6060.circles),
-    "Restoring Point Code Text did not restore deterministic point circles.",
-  );
-
-  const inspectEtch = async (label, view, suffix) => {
-    await selectView(label, view);
-    return page.evaluate(
-      (expectedView, expectedSuffix) => {
-        const svg = document.querySelector(`.preview-frame svg[data-view="${expectedView}"]`);
-        if (!(svg instanceof SVGSVGElement)) return null;
-        const operativeGroup = svg.querySelector(`#FTO_ETCH_${expectedSuffix}`);
-        const operative = operativeGroup
-          ? [...operativeGroup.querySelectorAll(":scope > path")]
-          : [];
-        const guides = svg.querySelector("#GUIDES_NON_PRINTING");
-        const inheritedAttribute = (element, name) => {
-          for (let current = element; current && current !== guides?.parentElement; current = current.parentElement) {
-            const value = current.getAttribute(name);
-            if (value !== null) return value;
-          }
-          return null;
-        };
-        const guideStrokes = guides
-          ? [...guides.querySelectorAll("path, rect, line, polyline, polygon")]
-              .map((element) => ({
-                stroke: inheritedAttribute(element, "stroke"),
-                width: inheritedAttribute(element, "stroke-width"),
-              }))
-              .filter(({ stroke }) => stroke && stroke !== "none")
-          : [];
-        const connectivity = svg.querySelector(
-          `#ETCH_${expectedSuffix}_TERMINAL_CONNECTIVITY_GUIDE`,
-        );
-        const strips = connectivity
-          ? [...connectivity.querySelectorAll(':scope > rect[data-region-id$="strip-guide"]')]
-          : [];
-        const source = svg.outerHTML;
-        return {
-          operativeWidth: operativeGroup?.getAttribute("stroke-width"),
-          paths: operative.map((path) => ({
-            index: path.getAttribute("data-path-index"),
-            source: path.getAttribute("data-source"),
-            plate: path.getAttribute("data-plate"),
-            boundaryIndex: path.getAttribute("data-boundary-index"),
-            cells: path.getAttribute("data-cells"),
-            perimeterIndex: path.getAttribute("data-perimeter-index"),
-            pieceIndex: path.getAttribute("data-piece-index"),
-            isolationIndex: path.getAttribute("data-isolation-index"),
-            d: path.getAttribute("d"),
-          })),
-          guidePresent: guides !== null,
-          guideStrokes,
-          dashed: /stroke-dasharray/i.test(source),
-          circles: svg.querySelectorAll("circle").length,
-          removedData:
-            /FONT_|fontArtwork|font-voronoi|glyph|microcell|POINT_CODE|knockout|data-slot|data-site/i.test(
-              source,
-            ),
-          stripHeights: strips.map((rect) => Number(rect.getAttribute("height"))),
-          stripWidths: strips.map((rect) => Number(rect.getAttribute("width"))),
-          corridors:
-            connectivity?.querySelectorAll(':scope > path[data-region-id$="corridor-guide"]')
-              .length ?? 0,
-          gates:
-            connectivity?.querySelectorAll(':scope > path[data-region-id$="gate-guide"]')
-              .length ?? 0,
-          terminalConnectivity:
-            svg.querySelector(
-              '[id*="TERMINAL_CONNECTIVITY"], [data-region-id$="strip-guide"], [data-region-id$="corridor-guide"], [data-region-id$="gate-guide"]',
-            ) !== null,
-        };
-      },
-      view,
-      suffix,
-    );
-  };
-
-  const etch6066 = await inspectEtch("Etch 6066", "etch-6066", "6066");
-  const etch6060 = await inspectEtch("Etch 6060", "etch-6060", "6060");
-  for (const [suffix, plate, etch] of [
-    ["6066", "glass-6066", etch6066],
-    ["6060", "glass-6060", etch6060],
-  ]) {
-    ensure(etch, `Etch ${suffix} SVG was not found.`);
-    sameArray(
-      etch.paths.map(({ index }) => index),
-      etch.paths.map((_, index) => String(index)),
-      `Etch ${suffix} path indexes are not canonical`,
-    );
-    ensure(
-      etch.paths.length > 0 &&
-        etch.paths.every(
-          (path) =>
-            path.plate === plate &&
-            ["electrode-voronoi", "active-perimeter", "terminal-isolation"].includes(
-              path.source,
-            ),
-        ) &&
-        etch.paths.filter(({ source }) => source === "terminal-isolation").length === 2 &&
-        etch.operativeWidth === "0.08",
-      `Etch ${suffix} operative paths or default width are incorrect.`,
-    );
-    ensure(
-      etch.guidePresent &&
-        etch.guideStrokes.length > 0 &&
-        etch.guideStrokes.every(({ width }) => width === "0.06") &&
-        !etch.dashed &&
-        etch.circles === 0 &&
-        !etch.removedData,
-      `Etch ${suffix} guides are not solid 0.06 mm or contain point/font data.`,
-    );
-  }
-  ensure(
-    etch6066.stripHeights.length === 2 &&
-      etch6066.stripHeights.every((height) => height === 60) &&
-      etch6066.stripWidths.every((width) => width > 0) &&
-      etch6066.corridors === 2 &&
-      etch6066.gates === 2,
-    "Etch 6066 does not have two full-height strips plus two corridor and two gate guides.",
-  );
-  ensure(
-    !etch6060.terminalConnectivity,
-    "Etch 6060 unexpectedly contains 6066 terminal connectivity guides.",
-  );
-
-  await selectView("Binding", "binding");
-  const binding = await page.evaluate(() => {
-    const svg = document.querySelector('.preview-frame svg[data-view="binding"]');
-    if (!(svg instanceof SVGSVGElement)) return null;
-    const mask = svg.querySelector("#BINDING_MASK");
-    const ring = mask?.querySelector(':scope > path[data-region-id="binding-outer-ring"]');
-    const boundaries = mask
-      ? [...mask.querySelectorAll('path[data-region-id^="binding-intercell-"]')]
-      : [];
-    const boundaryGroup = boundaries[0]?.parentElement;
-    return {
-      ring: ring !== null,
-      ringFillRule: ring?.getAttribute("fill-rule"),
-      boundaries: boundaries.length,
-      boundaryIds: boundaries.map((path) => path.getAttribute("data-region-id")),
-      boundaryIndexes: boundaries.map((path) => Number(path.getAttribute("data-boundary-index"))),
-      boundaryCells: boundaries.map((path) => path.getAttribute("data-cells")),
-      strokeWidth: boundaryGroup?.getAttribute("stroke-width"),
-      dashed: /stroke-dasharray/i.test(svg.outerHTML),
-      forbidden:
-        /GUIDE|ELECTRON|FONT_|fontArtwork|glyph|microcell|POINT_CODE|TERMINAL/i.test(
-          svg.outerHTML,
-        ) ||
-        svg.querySelectorAll("text, circle").length > 0,
-    };
-  });
-  ensure(binding, "Binding SVG was not found.");
-  ensure(binding.ring && binding.ringFillRule === "evenodd", "BINDING_MASK lacks its outer ring.");
-  ensure(binding.boundaries > 0, "BINDING_MASK has no inter-cell shared boundaries.");
-  sameArray(
-    binding.boundaryIndexes,
-    Array.from({ length: binding.boundaries }, (_, index) => index),
-    "Binding boundary indexes are incomplete",
-  );
-  ensure(
-    binding.boundaryIds.every((id, index) => id === `binding-intercell-${index}`) &&
-      binding.boundaryCells.every((cells) => /^\d+,\d+$/.test(cells ?? "")),
-    "Binding paths do not identify every inter-cell shared boundary.",
-  );
-  ensure(
-    binding.strokeWidth === "3" && !binding.dashed && !binding.forbidden,
-    "Binding contains forbidden references or does not use the UI's 3 mm width.",
-  );
-
-  await clickButton("Complete ZIP: PDF + 1-bit TIFF");
-  await page.waitForFunction(
-    () =>
-      document.querySelector(".export-progress") !== null ||
-      document.querySelector(".error-well") !== null,
-    { timeout: 30_000 },
-  );
-  await page.waitForFunction(
-    () =>
-      document.querySelector(".export-progress") === null ||
-      document.querySelector(".error-well") !== null,
-    { timeout: 240_000 },
-  );
-  const exportError = await page.evaluate(
-    () => document.querySelector(".error-well")?.textContent?.trim() ?? "",
-  );
-  ensure(!exportError, `Browser export failed: ${exportError}`);
-
-  let zipPath = "";
-  const downloadDeadline = Date.now() + 30_000;
-  while (Date.now() < downloadDeadline) {
-    const filenames = await readdir(downloadDirectory);
-    const zipName = filenames.find((name) => name.endsWith(".zip"));
-    const partial = filenames.some((name) => name.endsWith(".crdownload"));
-    if (zipName && !partial) {
-      zipPath = join(downloadDirectory, zipName);
-      break;
+  const laser = JSON.parse(strFromU8(vector["laser-fill/toolpaths.json"]));
+  ensure(laser.plates["glass-6060"].mirroredHorizontally && laser.plates["glass-6066"].scans.length > project.geometry.etchPaths["glass-6066"].length, "Fill scanning / mirror failed");
+  project.geometry.etchPaths["glass-6066"].forEach((p, i) => {
+    if (p.source === "voronoi-bleed") {
+      const scans = laser.plates["glass-6066"].scans.filter((s) => s.pathIndex === i);
+      ensure(scans.length && scans.every((s) => [s.start, s.end].some((p) => Math.min(Math.abs(p.x),
+        Math.abs(p.x - project.geometry.glass6066.width), Math.abs(p.y), Math.abs(p.y - project.geometry.glass6066.height)) < 1e-7)),
+        "A laser bleed scan stops short of the physical glass edge");
     }
-    await sleep(100);
-  }
-  ensure(zipPath, "The complete fabrication ZIP was not downloaded.");
-
-  const files = unzipSync(new Uint8Array(await readFile(zipPath)));
-  const bundlePaths = Object.keys(files).sort();
-  ensure(bundlePaths.length === 24, `Expected 24 bundle files, received ${bundlePaths.length}.`);
-  sameArray(bundlePaths, expectedBundlePaths, "Complete bundle paths are stale or incomplete");
-  const layeredPaths = bundlePaths.filter((path) => path.startsWith("svg-layered/"));
-  const productionPaths = bundlePaths.filter((path) => path.startsWith("svg-production/"));
-  const pdfPaths = bundlePaths.filter((path) => path.endsWith(".pdf"));
-  const bundledTiffPaths = bundlePaths.filter((path) => path.endsWith(".tif"));
-  ensure(
-    layeredPaths.length === 7 &&
-      productionPaths.length === 5 &&
-      pdfPaths.length === 6 &&
-      bundledTiffPaths.length === 2,
-    "Complete bundle category counts are not 7 layered, 5 production, 6 PDF, and 2 TIFF.",
-  );
-  ensure(
-    !bundlePaths.some((path) => /font-voronoi|dye[12]|glyph|background/i.test(path)),
-    "Complete bundle retains a removed operation filename.",
-  );
-
-  const designText = strFromU8(files["design.json"]);
-  const project = JSON.parse(designText);
-  ensure(project.format === "w-series-dssc-project-v4", "design.json is not project v4.");
-  sameArray(
-    Object.keys(project).sort(),
-    ["config", "description", "format", "geometry", "pointCodeArtwork", "units"].sort(),
-    "design.json top-level fields are stale",
-  );
-  ensure(
-    /terminal-isolation/.test(project.description ?? ""),
-    "design.json does not describe terminal isolation.",
-  );
-  ensure(
-    project.config.subcellCount === 4 &&
-      project.config.text === defaultText &&
-      project.config.bindingWidthMm === 3 &&
-      project.config.electrodeJitter === 0.34 &&
-      project.config.ftoEtchWidthMm === 0.08 &&
-      project.pointCodeArtwork.slotCount === 20 &&
-      project.pointCodeArtwork.placements.length === 20 &&
-      project.pointCodeArtwork.codeEmMm > 0,
-    "design.json does not contain the tested v4 four-cell point-code design.",
-  );
-  sameArray(
-    Object.keys(project.pointCodeArtwork).sort(),
-    pointCodeKeys,
-    "pointCodeArtwork fields are stale",
-  );
-  sameArray(
-    project.pointCodeArtwork.slotsPerSubcell,
-    [5, 5, 5, 5],
-    "design.json slotsPerSubcell is incorrect",
-  );
-  ensure(
-    project.pointCodeArtwork.normalizedText === defaultText &&
-      project.pointCodeArtwork.spaceCount === 2,
-    "design.json point-code text metadata is incorrect.",
-  );
-  project.pointCodeArtwork.placements.forEach((placement, index) => {
-    sameArray(
-      Object.keys(placement).sort(),
-      placementKeys,
-      `Point-code placement ${index} fields are stale`,
-    );
-    ensure(
-      placement.slotIndex === index &&
-        Number.isInteger(placement.slotIndexInSubcell) &&
-        Number.isInteger(placement.subcellIndex) &&
-        typeof placement.character === "string" &&
-        Array.isArray(placement.sites) &&
-        placement.sites.every(
-          (site) => Number.isFinite(site?.x) && Number.isFinite(site?.y),
-        ),
-      `Point-code placement ${index} is malformed.`,
-    );
   });
-  ensure(
-    !Object.prototype.hasOwnProperty.call(project, "fontArtwork") &&
-      !/fontArtwork|slotPolygon|fontMarginMm|fontEdgeWidthMm|fontSiteRadiusMm|glyph|microcell/i.test(
-        designText,
-      ),
-    "design.json retains removed font or slot-polygon artwork.",
-  );
-  for (const staleField of [...removedConfigKeys, "surlynOuter", "surlynInner"]) {
-    ensure(!designText.includes(`"${staleField}"`), `design.json retains stale field ${staleField}.`);
+  const galvo = JSON.parse(strFromU8(vector["fto-galvo-toolpaths.json"]));
+  for (const side of ["left", "right"]) {
+    ensure(galvo.plates["glass-6066"].paths.filter((p) => p.sharedSide === side).length === 1,
+      "Galvo output repeats a shared side cut");
+    const svg = strFromU8(vector["svg-production/fto-etch-glass-6066.svg"]);
+    ensure((svg.match(new RegExp(`data-shared-side="${side}"`, "g")) ?? []).length === 1,
+      "Production SVG repeats a shared side cut");
   }
-  const projectGeometry = validateProjectGeometry(project);
-  ensure(
-    binding.boundaries === project.geometry.boundaries.length,
-    "Binding preview omitted an exported inter-cell shared boundary.",
-  );
-  for (const [plate, etch] of [
-    ["glass-6066", etch6066],
-    ["glass-6060", etch6060],
-  ]) {
-    sameArray(
-      etch.paths.map(({ source }) => source),
-      project.geometry.etchPaths[plate].map(({ source }) => source),
-      `${plate} preview sources differ from canonical geometry.etchPaths`,
-    );
-  }
-  const expectedScreenPoints = (parity) =>
-    project.pointCodeArtwork.placements
-      .filter(
-        (placement) =>
-          placement.character !== " " && placement.subcellIndex % 2 === parity,
-      )
-      .reduce((total, placement) => total + placement.sites.length, 0);
-  ensure(
-    screen6066.circles.length === expectedScreenPoints(0) &&
-      screen6060.circles.length === expectedScreenPoints(1),
-    "Screen point-circle counts differ from pointCodeArtwork placements.",
-  );
-
-  const galvo = JSON.parse(strFromU8(files["fto-galvo-toolpaths.json"]));
-  const galvoCounts = validateGalvo(galvo, project);
-
-  const productionEtchCounts = {};
-  for (const [plate, suffix] of [
-    ["glass-6066", "6066"],
-    ["glass-6060", "6060"],
-  ]) {
-    const productionEtch = strFromU8(
-      files[`svg-production/fto-etch-glass-${suffix}.svg`],
-    );
-    productionEtchCounts[plate] = validateProductionEtch(
-      productionEtch,
-      suffix,
-      project.geometry.etchPaths[plate],
-      0.08,
-    );
+  for (const plate of ["glass-6066", "glass-6060"]) {
+    const outputPlate = galvo.plates[plate];
+    ensure(outputPlate.isolationRoutes.length === (plate === "glass-6066" ? 2 : 0) && outputPlate.isolationRoutes.every((r) =>
+      r.continuousTopToBottom && Math.abs(r.points[0].y) < 1e-7 && Math.abs(r.points.at(-1).y - outputPlate.heightMm) < 1e-7),
+      `${plate} has no two complete glass-top to glass-bottom isolation routes`);
+    const misses = await page.evaluate(async (source, output) => {
+      const image = new Image(); image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`; await image.decode();
+      const scale = 50, canvas = document.createElement("canvas");
+      canvas.width = Math.round(output.widthMm * scale); canvas.height = Math.round(output.heightMm * scale);
+      const ctx = canvas.getContext("2d"); ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const px = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      let missing = 0;
+      for (const route of output.paths) route.points.slice(1).forEach((b, i) => {
+        const a = route.points[i];
+        for (const t of [0.15, 0.35, 0.5, 0.65, 0.85]) {
+          const x = Math.max(0, Math.min(canvas.width - 1, Math.floor((a.x + (b.x - a.x) * t) * scale)));
+          const y = Math.max(0, Math.min(canvas.height - 1, Math.floor((a.y + (b.y - a.y) * t) * scale)));
+          if (px[(y * canvas.width + x) * 4] > 128) missing++;
+        }
+      });
+      return missing;
+    }, strFromU8(vector[`svg-production/fto-etch-${plate}.svg`]), outputPlate);
+    ensure(misses === 0, `${plate} has ${misses} unetched samples along an alleged full-height route`);
   }
 
-  for (const [suffix, baseline, indexes] of [
-    ["6066", screen6066, [0, 2]],
-    ["6060", screen6060, [1, 3]],
-  ]) {
-    const layered = strFromU8(files[`svg-layered/screen-glass-${suffix}-tio2.svg`]);
-    const production = strFromU8(files[`svg-production/screen-glass-${suffix}-tio2.svg`]);
-    ensure(production === layered, `Production Screen ${suffix} differs from clean layered SVG.`);
-    const regionGroup = svgGroupContents(production, `SCREEN_${suffix}_TIO2_REGIONS`);
-    const knockoutGroup = svgGroupContents(production, "SCREEN_POINT_CODE_KNOCKOUTS");
-    const regions = svgElements(regionGroup, "path");
-    const circles = svgElements(knockoutGroup, "circle");
-    sameArray(
-      regions.map((path) => svgAttribute(path, "d")),
-      baseline.regionDs,
-      `Bundled Screen ${suffix} region paths differ from preview`,
-    );
-    sameArray(
-      regions.map((path) => svgAttribute(path, "data-subcell-index")),
-      indexes.map(String),
-      `Bundled Screen ${suffix} region parity is wrong`,
-    );
-    ensure(
-      regions.every((path) => svgAttribute(path, "data-material") === "tio2") &&
-        circles.length === baseline.circles.length &&
-        circles.every(
-          (circle) =>
-            /^cell-\d+-slot-\d+-site-\d+$/.test(svgAttribute(circle, "id")) &&
-            svgAttribute(circle, "id") === svgAttribute(circle, "data-region-id") &&
-            svgAttribute(circle, "r") === "0.03",
-        ) &&
-        new Set(circles.map((circle) => svgAttribute(circle, "id"))).size ===
-          circles.length,
-      `Bundled Screen ${suffix} regions or point circles are incorrect.`,
-    );
-    ensure(
-      !/<text\b|\sstroke(?:-[\w-]+)?=/i.test(production) &&
-        !/FONT_|fontArtwork|font-voronoi|glyph|microcell/i.test(production) &&
-        production.includes(`data-mirrored="${suffix === "6060" ? "true" : "false"}"`),
-      `Bundled Screen ${suffix} contains removed data or has incorrect mirroring.`,
-    );
-  }
-
-  const dxf = strFromU8(files["manufacturing-layout.dxf"]);
-  const dxfRecordList = dxfRecords(dxf);
-  const dxfEntityList = dxfEntities(dxfRecordList);
-  const expectedDxfLayers = [
-    "0",
-    "SCREEN_6066_TIO2_REGIONS",
-    "SCREEN_6060_TIO2_REGIONS",
-    "SCREEN_6066_POINT_KNOCKOUTS",
-    "SCREEN_6060_POINT_KNOCKOUTS",
-    "FTO_ETCH_6066",
-    "FTO_ETCH_6060",
-    "CIRCUIT_REFERENCE",
-    "BINDING",
-  ];
-  sameArray(declaredDxfLayers(dxfRecordList), expectedDxfLayers, "DXF layers are stale");
-  ensure(
-    !/FONT_VORONOI|FONT_SITES|fontArtwork|glyph|microcell/i.test(dxf),
-    "DXF contains a removed font layer or entity.",
-  );
-  for (const [suffix, baseline] of [
-    ["6066", screen6066],
-    ["6060", screen6060],
-  ]) {
-    const regions = dxfEntitiesOn(dxfEntityList, `SCREEN_${suffix}_TIO2_REGIONS`);
-    const circles = dxfEntitiesOn(dxfEntityList, `SCREEN_${suffix}_POINT_KNOCKOUTS`);
-    ensure(
-      regions.length === 2 && regions.every(({ type }) => type === "LWPOLYLINE"),
-      `DXF Screen ${suffix} does not have two TiO2 region polylines.`,
-    );
-    ensure(
-      circles.length === baseline.circles.length &&
-        circles.every(
-          (entity) =>
-            entity.type === "CIRCLE" &&
-            Number(dxfEntityValue(entity, "40")) === 0.03 &&
-            /^cell-\d+-slot-\d+-site-\d+$/.test(dxfCircleId(entity)),
-        ) &&
-        new Set(circles.map(dxfCircleId)).size === circles.length,
-      `DXF Screen ${suffix} knockout circles are incorrect.`,
-    );
-    sameArray(
-      circles.map(dxfCircleId),
-      baseline.circles.map(({ id }) => id),
-      `DXF Screen ${suffix} point IDs differ from the screen SVG`,
-    );
-  }
-
-  for (const path of pdfPaths) {
-    validatePdf(files[path], path);
-  }
-
-  const tiffs = [
-    parseBilevelTiff(files[tiffPaths[0]], tiffPaths[0], 3118, 2835),
-    parseBilevelTiff(files[tiffPaths[1]], tiffPaths[1], 2835, 2835),
-  ];
-
-  await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 1 });
-  await page.waitForFunction(
-    () => {
-      const split = document.querySelector(".main-split");
-      return split && getComputedStyle(split).flexDirection === "column";
-    },
-    { timeout: 10_000 },
-  );
-  const mobile = await page.evaluate(async () => {
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    const split = document.querySelector(".main-split");
-    const sidebar = document.querySelector(".sidebar-panel")?.getBoundingClientRect();
-    const preview = document.querySelector(".preview-panel")?.getBoundingClientRect();
-    return {
-      display: split ? getComputedStyle(split).display : "",
-      flexDirection: split ? getComputedStyle(split).flexDirection : "",
-      viewportWidth: window.innerWidth,
-      scrollWidth: Math.max(
-        document.documentElement.scrollWidth,
-        document.body?.scrollWidth ?? 0,
-      ),
-      stacked: Boolean(sidebar && preview && preview.top >= sidebar.bottom - 1),
+  // Independent proof on rendered PRODUCTION etch pixels: flood retained white
+  // FTO over the entire glass, including strips and all external margins.
+  const netRaster = await page.evaluate(async (source, geometry) => {
+    const scale = 50, w = Math.round(geometry.glass6066.width * scale), h = Math.round(geometry.glass6066.height * scale);
+    const index = (p) => Math.floor(p.y * scale) * w + Math.floor(p.x * scale);
+    const check = async (omitCrosscuts) => {
+      const doc = new DOMParser().parseFromString(source, "image/svg+xml");
+      if (omitCrosscuts) doc.querySelectorAll('[data-source="voronoi-bleed"]').forEach((p) => p.remove());
+      const image = new Image();
+      image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(new XMLSerializer().serializeToString(doc.documentElement))}`;
+      await image.decode();
+      const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext("2d"); ctx.drawImage(image, 0, 0, w, h);
+      const px = ctx.getImageData(0, 0, w, h).data, visited = new Uint8Array(w * h), queue = new Int32Array(w * h);
+      const flood = (seed, label) => {
+        let read = 0, end = 0;
+        if (px[seed * 4] < 128 || visited[seed]) return;
+        queue[end++] = seed; visited[seed] = label;
+        const add = (i) => { if (!visited[i] && px[i * 4] >= 128) { visited[i] = label; queue[end++] = i; } };
+        while (read < end) {
+          const i = queue[read++], x = i % w;
+          if (x) add(i - 1); if (x < w - 1) add(i + 1);
+          if (i >= w) add(i - w); if (i < w * (h - 1)) add(i + w);
+        }
+      };
+      const a = index(geometry.terminals[0].contact), b = index(geometry.terminals[1].contact);
+      flood(a, 1);
+      const short = visited[b] === 1;
+      flood(b, 2);
+      const vertexMean = (r) => ({ x: r.reduce((s, p) => s + p.x, 0) / r.length, y: r.reduce((s, p) => s + p.y, 0) / r.length });
+      let label = 3;
+      const cellIslands = geometry.fabrication.activeRegions.map((r) => {
+        const seed = index(vertexMean(r));
+        if (!visited[seed]) flood(seed, label++);
+        return visited[seed] || -1;
+      });
+      return { short, negativeCell: visited[index(vertexMean(geometry.fabrication.activeRegions[0]))] === 1,
+        positiveCell: visited[index(vertexMean(geometry.fabrication.activeRegions.at(-1)))] === 2,
+        cellIslands,
+        strips: geometry.terminals.every((t, n) => [0.01, 0.5, 0.99].every((v) =>
+          visited[index({ x: t.contact.x, y: v * geometry.glass6066.height })] === n + 1)) };
     };
-  });
-  ensure(
-    mobile.display === "flex" &&
-      mobile.flexDirection === "column" &&
-      mobile.stacked &&
-      mobile.scrollWidth <= mobile.viewportWidth,
-    `Unexpected 390 px mobile layout: ${JSON.stringify(mobile)}.`,
-  );
+    return { actual: await check(false), missingCrosscuts: await check(true) };
+  }, strFromU8(vector["svg-production/fto-etch-glass-6066.svg"]), project.geometry);
+  ensure(!netRaster.actual.short && netRaster.actual.negativeCell && netRaster.actual.positiveCell && netRaster.actual.strips,
+    `Production etch raster has a short / open contact: ${JSON.stringify(netRaster.actual)}`);
+  ensure(netRaster.missingCrosscuts.short, "Raster test did not detect the deliberately introduced annular bypass");
+  for (let i = 0; i < f.activeRegions.length; i++) for (let j = i + 1; j < f.activeRegions.length; j++) {
+    const expected = j === i + 1 && i % 2 === 1;
+    ensure((netRaster.actual.cellIslands[i] === netRaster.actual.cellIslands[j]) === expected,
+      `Production SVG changes the W-series net between cells ${i + 1}/${j + 1}`);
+  }
 
-  ensure(
-    runtimeErrors.length === 0,
-    `Browser runtime errors: ${[...new Set(runtimeErrors)].join(" | ")}`,
-  );
+  // Render the actual production SVG, not DOM-only assertions: every slot must
+  // have a white continuous centreline through the printed seal.
+  const raster = await page.evaluate(async (source, ports) => {
+    const image = new Image();
+    image.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`;
+    await image.decode();
+    const canvas = document.createElement("canvas"); canvas.width = 3300; canvas.height = 3000;
+    const ctx = canvas.getContext("2d"); ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let dark = 0;
+    for (const p of ports) for (let i = 1; i < 100; i++) {
+      const x = Math.floor((p.x + p.width / 2) * 50), y = Math.min(2999, Math.floor((p.y + p.height * i / 100) * 50));
+      if (pixels[(y * 3300 + x) * 4] < 240) dark++;
+    }
+    return dark;
+  }, strFromU8(vector["svg-production/binding-mask.svg"]), f.ports);
+  ensure(raster === 0, `Binding SVG has ${raster} blocked slot samples`);
 
-  console.log(
-    JSON.stringify({
-      camera: {
-        zoomPercent: Number.parseInt(cameraZoomed.readout, 10),
-        zoomScale: Number(zoomValues.scale.toFixed(3)),
-        panDelta: [
-          Number((panValues.x - panStart.x).toFixed(1)),
-          Number((panValues.y - panStart.y).toFixed(1)),
-        ],
-        fit: cameraFit.readout,
-        tabReset: cameraTabReset.readout,
-        wheelPrevented: cameraZoomed.wheelPrevented,
-      },
-      numeric: numericSummary,
-      text: {
-        rows: initial.textarea.rows,
-        fontSizePx: initial.textarea.fontSizePx,
-        characters: defaultText.length,
-        mutationChecked: true,
-      },
-      screens: {
-        regions: [screen6066.regionDs.length, screen6060.regionDs.length],
-        points: [screen6066.circles.length, screen6060.circles.length],
-        mirrored6060: screen6060.mirrored === "true",
-        spacesPoints: spaces6066.circles.length + spaces6060.circles.length,
-      },
-      bundle: {
-        files: bundlePaths.length,
-        layered: layeredPaths.length,
-        production: productionPaths.length,
-        pdfs: pdfPaths.length,
-        tiffs: tiffs.map(({ width, height, bitsPerSample }) => ({
-          width,
-          height,
-          bitsPerSample,
-        })),
-      },
-      mobile,
-    }),
-  );
+  const sealView = async (label, group, stage) => {
+    await button(label);
+    await page.waitForFunction((id, wanted) => document.querySelector(`#${id}`)?.getAttribute("data-seal-stage") === wanted &&
+      document.querySelector('[data-testid="seal-stage"]')?.getAttribute("data-seal-stage") === wanted,
+      { timeout: 30000 }, group, stage);
+    return page.evaluate((id) => [...document.querySelectorAll(`#${id} > path`)].map((p) => p.getAttribute("d")), group);
+  };
+  const toggleSeal = async (group, stage) => {
+    await page.click('[data-testid="seal-stage-toggle"]');
+    await page.waitForFunction((id, wanted) => document.querySelector(`#${id}`)?.getAttribute("data-seal-stage") === wanted,
+      { timeout: 30000 }, group, stage);
+  };
+  const printedSeal = await sealView("Binding", "BINDING_MASK", "printed");
+  await page.screenshot({ path: join(directory, "binding.png") });
+  const assemblyPrintedSeal = await sealView("Final Assembly", "ASSEMBLY_SEAL", "printed");
+  ensure(JSON.stringify(assemblyPrintedSeal) === JSON.stringify(printedSeal), "Default Assembly uses a different glue mask than Binding");
+  await page.screenshot({ path: join(directory, "assembly.png") });
+  await toggleSeal("ASSEMBLY_SEAL", "compression-scenario");
+  const assemblyScenario = await page.evaluate(() => [...document.querySelectorAll("#ASSEMBLY_SEAL > path")].map((p) => p.getAttribute("d")));
+  const bindingScenario = await sealView("Binding", "BINDING_MASK", "compression-scenario");
+  ensure(JSON.stringify(bindingScenario) === JSON.stringify(assemblyScenario), "Scenario stages do not match across tabs");
+  ensure(JSON.stringify(bindingScenario) !== JSON.stringify(printedSeal), "Scenario toggle has no effect");
+  ensure(await page.$eval('[data-testid="seal-stage-toggle"]', (el) => el.checked), "Shared stage selection was lost on tab switch");
+  await page.screenshot({ path: join(directory, "binding-compression-envelope.png") });
+  await toggleSeal("BINDING_MASK", "printed");
+  const resetAssembly = await sealView("Final Assembly", "ASSEMBLY_SEAL", "printed");
+  ensure(JSON.stringify(resetAssembly) === JSON.stringify(printedSeal), "Turning off the scenario does not restore matching printed masks");
+  // Export while the scenario is displayed; production must still be printed geometry.
+  await toggleSeal("ASSEMBLY_SEAL", "compression-scenario");
+  const complete = await download("Complete ZIP: PDF + 1-bit TIFF");
+  ensure(Object.keys(complete).length === 28, "Complete bundle count differs from 28");
+  ensure(strFromU8(complete["svg-production/binding-mask.svg"]) === strFromU8(vector["svg-production/binding-mask.svg"]),
+    "Scenario preview changed the production adhesive mask");
+  ensure(strFromU8(complete["svg-layered/assembly-preview.svg"]) === strFromU8(vector["svg-layered/assembly-preview.svg"]),
+    "Scenario preview changed the default exported assembly reference");
+  for (const [name, data] of Object.entries(complete)) {
+    if (name.endsWith(".pdf")) ensure(strFromU8(data.slice(0, 5)) === "%PDF-" && data.length > 500, `Invalid PDF: ${name}`);
+    if (name.endsWith(".tif")) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      ensure(view.getUint16(2, true) === 42, "TIFF magic");
+      const offset = view.getUint32(4, true), n = view.getUint16(offset, true);
+      const tags = new Map(Array.from({ length: n }, (_, i) => {
+        const k = offset + 2 + 12 * i; return [view.getUint16(k, true), view.getUint32(k + 8, true)];
+      }));
+      ensure(tags.get(258) === 1 && tags.get(259) === 1 && tags.get(277) === 1, "TIFF is not uncompressed true 1-bit");
+    }
+  }
+  ensure(errors.length === 0, `Browser errors: ${errors.join("; ")}`);
+  const estimates = JSON.parse(strFromU8(vector["process-estimates.json"]));
+  const independentCurrents = f.cellAreasMm2.map((area) => area / 100 * project.config.jscMaCm2 * project.config.irradianceMwCm2 / 100);
+  const minimumCurrent = Math.min(...independentCurrents);
+  ensure(Math.abs(estimates.electrical.iscMa - minimumCurrent) < 1e-9 &&
+    estimates.electrical.limitingCellNumber === f.cellAreasMm2.indexOf(Math.min(...f.cellAreasMm2)) + 1 &&
+    estimates.electrical.cellIscMa.every((value, i) => Math.abs(value - independentCurrents[i]) < 1e-9),
+    "Exported electrical estimate does not retain weakest-cell current and identity");
+  ensure(Math.abs((await electricalReadout()).iscMa - minimumCurrent) < 1e-9,
+    "Displayed series Isc differs from the exported weakest-cell estimate");
+  ensure(estimates.electrical.fto.paths.length === project.geometry.cells.length * 2 &&
+    estimates.electrical.scenario.confidence === "unfitted-scenario" &&
+    Math.abs((await electricalReadout()).ftoIscMa - estimates.electrical.scenario.iscMa) < 1e-9,
+    "Exported FTO / I–V scenario is missing or differs from the UI");
+  console.log(JSON.stringify({ status: "PASS", vectorFiles: 20, completeFiles: 28, fillPorts: f.ports.length,
+    activeAreaMm2: f.totalActiveMm2, cellMinMm2: Math.min(...f.cellAreasMm2), cellMaxMm2: Math.max(...f.cellAreasMm2),
+    areaCv: f.areaCv, printWidthMm: project.config.bindingWidthMm, actualStencil: estimates.actualStencil,
+    screenshotAperture, apertureDesign: estimates.apertureDesign, electrical: estimates.electrical,
+    terminalCheck: f.terminalCheck, terminalRaster: netRaster,
+    depositUm: estimates.seal.depositUm, depositSource: estimates.seal.depositSource, screenshots: directory }, null, 2));
 } finally {
   await browser.close();
-  await rm(downloadDirectory, { recursive: true, force: true });
 }

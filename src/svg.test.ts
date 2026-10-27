@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildGeometry, pointInConvexPolygon } from "./geometry";
+import { stripNonPrintingGuides } from "./export";
 import {
   DEFAULT_CONFIG,
   POINT_CODE_MIN_GAP_MM,
@@ -168,14 +169,9 @@ function expectedScreenRegions(
   geometry: LayoutGeometry,
   plate: PlateId,
 ) {
-  const bindingWidth = Number.isFinite(config.bindingWidthMm)
-    ? Math.max(0, config.bindingWidthMm)
-    : 0;
+  void config;
   return selectedCells(geometry, plate).flatMap((cell) => {
-    const polygon = insetConvexPolygon(
-      cell.polygon,
-      bindingWidth / 2,
-    );
+    const polygon = geometry.fabrication.activeRegions[cell.index];
     return polygon.length >= 3 ? [{ cell, polygon }] : [];
   });
 }
@@ -250,9 +246,8 @@ describe("fabrication assets and preview dimensions", () => {
   it("reports seven view sizes, preserves the circuit gap, and rejects the removed view", () => {
     const { config, geometry, pointCodes } = fixture({
       glass6066WidthMm: 70,
-      glass6066HeightMm: 64,
+      glassHeightMm: 64,
       glass6060WidthMm: 58,
-      glass6060HeightMm: 54,
     });
 
     expect(CIRCUIT_PANEL_GAP_MM).toBe(8);
@@ -269,7 +264,7 @@ describe("fabrication assets and preview dimensions", () => {
       expect(previewSize(geometry, mode)).toEqual({ widthMm: 70, heightMm: 64 });
     }
     for (const mode of ["glass-6060", "etch-6060"] as const) {
-      expect(previewSize(geometry, mode)).toEqual({ widthMm: 58, heightMm: 54 });
+      expect(previewSize(geometry, mode)).toEqual({ widthMm: 58, heightMm: 64 });
     }
     expect(() => previewSize(geometry, "font" as PreviewMode)).toThrow(
       "Unsupported preview mode",
@@ -281,6 +276,46 @@ describe("fabrication assets and preview dimensions", () => {
 });
 
 describe("assembly and circuit references", () => {
+  it("marks exposed positive / negative FTO at resized glass edges as non-printing assembly guides", () => {
+    const { config, geometry, pointCodes, assets } = fixture({ glass6066WidthMm: 70, glass6060WidthMm: 58, glassHeightMm: 64 });
+    const assembly = buildPreviewSvg(config, geometry, pointCodes, "assembly");
+    for (const [polarity, x] of [["NEGATIVE", 0], ["POSITIVE", 64]] as const) {
+      const group = groupOpening(assembly, `ASSEMBLY_ZEBRA_${polarity}`);
+      expect(Number(attribute(group, "data-strip-x"))).toBe(x);
+      expect(Number(attribute(group, "data-strip-width-mm"))).toBe(6);
+      expect(Number(attribute(group, "data-strip-height-mm"))).toBe(64);
+      expect(Number(attribute(group, "data-area-mm2"))).toBeCloseTo(384, 6);
+      expect(attribute(group, "data-connected")).toBe("true");
+    }
+    const scenario = buildPreviewSvg(config, geometry, pointCodes, "assembly", true);
+    expect(groupContents(scenario, "ASSEMBLY_ZEBRA_CONTACTS")).toBe(groupContents(assembly, "ASSEMBLY_ZEBRA_CONTACTS"));
+    expect(assetById(assets, "assembly-preview").svg).toContain("ASSEMBLY_ZEBRA_CONTACTS");
+    expect(stripNonPrintingGuides(assembly)).not.toContain("ASSEMBLY_ZEBRA_");
+    expect(assetById(assets, "binding-mask").svg).not.toContain("ASSEMBLY_ZEBRA_");
+    expect(assetById(assets, "screen-glass-6066-tio2").svg).not.toContain("ASSEMBLY_ZEBRA_");
+  });
+
+  it("shares exactly the same seal geometry and stage between Binding and Assembly", () => {
+    const { config, geometry, pointCodes } = fixture({ bindingWidthMm: 1, screenMeshPerInch: 140, screenWireUm: 14 });
+    const sealPaths = (svg: string, id: string) => pathElements(groupContents(svg, id)).map((p) => attribute(p, "d"));
+    const printedBinding = buildPreviewSvg(config, geometry, pointCodes, "binding", false);
+    const printedAssembly = buildPreviewSvg(config, geometry, pointCodes, "assembly", false);
+    const scenarioBinding = buildPreviewSvg(config, geometry, pointCodes, "binding", true);
+    const scenarioAssembly = buildPreviewSvg(config, geometry, pointCodes, "assembly", true);
+    expect(sealPaths(printedAssembly, "ASSEMBLY_SEAL")).toEqual(sealPaths(printedBinding, "BINDING_MASK"));
+    expect(sealPaths(scenarioAssembly, "ASSEMBLY_SEAL")).toEqual(sealPaths(scenarioBinding, "BINDING_MASK"));
+    expect(sealPaths(scenarioAssembly, "ASSEMBLY_SEAL")).not.toEqual(sealPaths(printedAssembly, "ASSEMBLY_SEAL"));
+    expect(attribute(groupOpening(printedAssembly, "ASSEMBLY_SEAL"), "data-seal-stage")).toBe("printed");
+    expect(attribute(groupOpening(scenarioAssembly, "ASSEMBLY_SEAL"), "data-seal-stage")).toBe("compression-scenario");
+    expect(attribute(groupOpening(printedAssembly, "ASSEMBLY_SEAL"), "fill")).toBe("#000000");
+    expect(groupContents(scenarioAssembly, "ASSEMBLY_CIRCUIT_MATERIAL_CELLS"))
+      .toBe(groupContents(printedAssembly, "ASSEMBLY_CIRCUIT_MATERIAL_CELLS"));
+    // Rendering a scenario must not contaminate either exported printed asset.
+    const assets = buildFabricationAssets(config, geometry, pointCodes);
+    expect(assetById(assets, "binding-mask").svg).toBe(printedBinding);
+    expect(assetById(assets, "assembly-preview").svg).toBe(printedAssembly);
+  });
+
   it("renders only top-level 6066 material blocks in the final assembly", () => {
     const { config, geometry, pointCodes } = fixture();
     const assembly = buildPreviewSvg(config, geometry, pointCodes, "assembly");
@@ -295,17 +330,17 @@ describe("assembly and circuit references", () => {
       expect(attribute(path, "data-material")).toBe(cell.glass6066Material);
       expectPointsClose(
         pathPoints(path),
-        cell.polygon.slice(0, -1).map((point) => assemblyPoint(geometry, point)),
+        geometry.fabrication.activeRegions[cell.index].map((point) => assemblyPoint(geometry, point)),
       );
     });
     const fills = new Set(cells.map((path) => attribute(path, "fill")));
     expect(fills.size).toBe(2);
     expect(assembly).not.toMatch(
-      /POINT_CODE|ELECTRON_ROUTE|GUIDES_NON_PRINTING|FTO_ETCH|BINDING_MASK/,
+      /POINT_CODE|ELECTRON_ROUTE|FTO_ETCH|BINDING_MASK/,
     );
     expect(assembly).not.toContain("<circle");
-    expect(assembly).not.toMatch(/<text\b/);
-    expect(assembly).not.toContain("stroke-width");
+    expect(textElements(groupContents(assembly, "ASSEMBLY_ZEBRA_CONTACTS")).map(textContent)).toEqual(["− ZEBRA", "+ ZEBRA"]);
+    expect(groupOpening(assembly, "GUIDES_NON_PRINTING")).toContain('data-output="non-printing"');
     expectGrayscale(assembly);
   });
 
@@ -326,8 +361,8 @@ describe("assembly and circuit references", () => {
     expect(Number(attribute(outline6066 ?? "", "height"))).toBe(60);
     expect(Number(attribute(outline6060 ?? "", "x"))).toBe(74);
     expect(Number(attribute(outline6060 ?? "", "width"))).toBe(60);
-    expect(attribute(outline6066 ?? "", "stroke-width")).toBe("0.06");
-    expect(attribute(outline6060 ?? "", "stroke-width")).toBe("0.06");
+    expect(attribute(outline6066 ?? "", "stroke-width")).toBe("");
+    expect(attribute(outline6060 ?? "", "stroke-width")).toBe("");
 
     for (const [suffix, plate] of [
       ["6066", "glass-6066"],
@@ -345,7 +380,7 @@ describe("assembly and circuit references", () => {
       );
 
       expect(cells).toHaveLength(geometry.cells.length);
-      expect(cells.every((path) => attribute(path, "stroke-width") === "0.06")).toBe(
+      expect(cells.every((path) => attribute(path, "stroke-width") === "")).toBe(
         true,
       );
       expect(cells.map((path) => attribute(path, "data-material"))).toEqual(
@@ -379,7 +414,7 @@ describe("assembly and circuit references", () => {
       groupContents(circuit, "CIRCUIT_6066_CONTACT_STRIPS"),
     );
     expect(contacts).toHaveLength(2);
-    expect(contacts.every((contact) => attribute(contact, "stroke-width") === "0.06")).toBe(
+    expect(contacts.every((contact) => attribute(contact, "stroke-width") === "")).toBe(
       true,
     );
     contacts.forEach((contact, index) => {
@@ -554,7 +589,7 @@ describe("binary TiO2 screen pages", () => {
       );
       const collapsed = selected.filter(
         (cell) =>
-          insetConvexPolygon(cell.polygon, config.bindingWidthMm / 2).length < 3,
+          geometry.fabrication.activeRegions[cell.index].length < 3,
       );
 
       expect(regions).toHaveLength(expected.length);
@@ -640,7 +675,7 @@ describe("binary TiO2 screen pages", () => {
 });
 
 describe("canonical etch views", () => {
-  it("emits geometry.etchPaths exactly with 0.06 mm solid guides", () => {
+  it("emits geometry.etchPaths exactly without extra framing strokes", () => {
     const { config, geometry, pointCodes } = fixture({ ftoEtchWidthMm: 0.33 });
 
     for (const [mode, plate, suffix] of [
@@ -672,6 +707,10 @@ describe("canonical etch views", () => {
             String(source.boundaryIndex),
           );
           expect(attribute(path, "data-cells")).toBe(source.cells?.join(","));
+        } else if (source.source === "voronoi-bleed") {
+          expect(attribute(path, "data-boundary-index")).toBe(String(source.boundaryIndex));
+          expect(attribute(path, "data-glass-edge")).toBe(source.glassEdge);
+          expect(attribute(path, "data-shared-side")).toBe(source.sharedSide ?? "");
         } else if (source.source === "active-perimeter") {
           expect(attribute(path, "data-perimeter-index")).toBe(
             String(source.perimeterIndex),
@@ -679,6 +718,9 @@ describe("canonical etch views", () => {
           expect(attribute(path, "data-piece-index")).toBe(
             String(source.pieceIndex),
           );
+        } else if (source.source === "contact-strip-isolation") {
+          expect(attribute(path, "data-polarity")).toBe(source.polarity);
+          expect(attribute(path, "data-piece-index")).toBe(String(source.pieceIndex));
         } else {
           expect(attribute(path, "data-isolation-index")).toBe(
             String(source.isolationIndex),
@@ -687,11 +729,10 @@ describe("canonical etch views", () => {
       });
       expect(
         operative.filter(
-          (path) => attribute(path, "data-source") === "terminal-isolation",
+          (path) => attribute(path, "data-source") !== "electrode-voronoi" && attribute(path, "data-source") !== "voronoi-bleed",
         ),
-      ).toHaveLength(2);
-      expect(guideWidths.length).toBeGreaterThan(0);
-      expect(guideWidths.every((width) => width === 0.06)).toBe(true);
+      ).toHaveLength(0);
+      expect(guideWidths).toEqual([]);
       expect(svg).not.toContain("stroke-dasharray");
       expect(svg).not.toContain("<circle");
       expect(svg).not.toMatch(/glyph|microcell|FONT_/i);
@@ -699,115 +740,38 @@ describe("canonical etch views", () => {
     }
   });
 
-  it("keeps full-height 6066 connectivity guides and no terminal guides on 6060", () => {
+  it("uses the physical glass page and labels, with no extra outline, artboard or gray net fills", () => {
     const { config, geometry, pointCodes } = fixture();
     const etch6066 = buildPreviewSvg(config, geometry, pointCodes, "etch-6066");
     const etch6060 = buildPreviewSvg(config, geometry, pointCodes, "etch-6060");
-    const connectivity = groupContents(
-      etch6066,
-      "ETCH_6066_TERMINAL_CONNECTIVITY_GUIDE",
-    );
-    const strips = rectElements(connectivity);
-    const corridors = pathElements(connectivity).filter((path) =>
-      attribute(path, "data-region-id").endsWith("corridor-guide"),
-    );
-    const gates = pathElements(connectivity).filter((path) =>
-      attribute(path, "data-region-id").endsWith("gate-guide"),
-    );
-
-    expect(strips).toHaveLength(2);
-    expect(corridors).toHaveLength(2);
-    expect(gates).toHaveLength(2);
-    strips.forEach((strip, index) => {
-      expect(Number(attribute(strip, "height"))).toBe(
-        geometry.terminals[index].contactStrip.height,
-      );
-      expect(attribute(strip, "stroke-width")).toBe("0.06");
-    });
-    expect(corridors.every((path) => attribute(path, "stroke-width") === "0.06")).toBe(
-      true,
-    );
-    expect(gates.every((path) => attribute(path, "stroke-width") === "0.06")).toBe(
-      true,
-    );
-    expect(etch6060).not.toMatch(
-      /TERMINAL_CONNECTIVITY|corridor-guide|gate-guide|strip-guide/,
-    );
+    for (const [svg, width, height] of [[etch6066, 66, 60], [etch6060, 60, 60]] as const) {
+      expect(hexColors(svg)).toEqual(["#000000", "#ffffff"]);
+      expect(svg).not.toMatch(/TERMINAL_CONNECTIVITY|corridor-guide|gate-guide|strip-guide|ENDPOINT_CELLS_GUIDE/);
+      expect(svg).toContain(`viewBox="0 0 ${width} ${height}"`);
+      expect(groupContents(svg, "GUIDES_NON_PRINTING")).not.toMatch(/<rect|<path/);
+    }
   });
 });
 
 describe("binding mask", () => {
-  it("uses the exact binding ring and every geometry.boundaries centerline", () => {
+  it("exports the actual opened seal polygons identically in view and production", () => {
     const { config, geometry, pointCodes, assets } = fixture({ bindingWidthMm: 4 });
     const binding = buildPreviewSvg(config, geometry, pointCodes, "binding");
     const asset = assetById(assets, "binding-mask");
     const mask = groupContents(binding, "BINDING_MASK");
     const paths = pathElements(mask);
-    const ring = paths.find(
-      (path) => attribute(path, "data-region-id") === "binding-outer-ring",
-    );
-    const boundaries = paths.filter((path) =>
-      attribute(path, "data-region-id").startsWith("binding-intercell-"),
-    );
-    const boundaryGroup = mask.match(
-      /<g\s+fill="none"[^>]*clip-path="url\(#BINDING_ACTIVE_CLIP\)"[^>]*>/,
-    )?.[0];
-
     expect(asset.filename).toBe("binding-mask.svg");
-    expect(paths).toHaveLength(geometry.boundaries.length + 1);
-    expect(ring).toBeDefined();
-    expect(attribute(ring ?? "", "fill-rule")).toBe("evenodd");
-    expect(pathLoops(ring ?? "")).toHaveLength(2);
-    expectPointsClose(
-      pathLoops(ring ?? "")[0],
-      [
-        { x: geometry.bindingOuter.x, y: geometry.bindingOuter.y },
-        {
-          x: geometry.bindingOuter.x + geometry.bindingOuter.width,
-          y: geometry.bindingOuter.y,
-        },
-        {
-          x: geometry.bindingOuter.x + geometry.bindingOuter.width,
-          y: geometry.bindingOuter.y + geometry.bindingOuter.height,
-        },
-        {
-          x: geometry.bindingOuter.x,
-          y: geometry.bindingOuter.y + geometry.bindingOuter.height,
-        },
-      ].map((point) => assemblyPoint(geometry, point)),
-    );
-    expectPointsClose(
-      pathLoops(ring ?? "")[1],
-      [
-        { x: geometry.bindingInner.x, y: geometry.bindingInner.y },
-        {
-          x: geometry.bindingInner.x + geometry.bindingInner.width,
-          y: geometry.bindingInner.y,
-        },
-        {
-          x: geometry.bindingInner.x + geometry.bindingInner.width,
-          y: geometry.bindingInner.y + geometry.bindingInner.height,
-        },
-        {
-          x: geometry.bindingInner.x,
-          y: geometry.bindingInner.y + geometry.bindingInner.height,
-        },
-      ].map((point) => assemblyPoint(geometry, point)),
-    );
-    expect(boundaries).toHaveLength(geometry.boundaries.length);
-    boundaries.forEach((path, index) => {
-      expect(attribute(path, "data-boundary-index")).toBe(String(index));
-      expect(attribute(path, "data-cells")).toBe(
-        geometry.boundaries[index].cells.join(","),
-      );
-      expectPointsClose(
-        pathPoints(path),
-        [geometry.boundaries[index].start, geometry.boundaries[index].end].map(
-          (point) => assemblyPoint(geometry, point),
-        ),
-      );
+    expect(binding).toBe(asset.svg);
+    expect(paths).toHaveLength(geometry.fabrication.sealPrint.length);
+    paths.forEach((path, i) => {
+      expect(attribute(path, "fill-rule")).toBe("evenodd");
+      const loops = pathLoops(path);
+      expect(loops).toHaveLength(geometry.fabrication.sealPrint[i].length);
+      loops.forEach((loop, j) => {
+        const ring = geometry.fabrication.sealPrint[i][j];
+        expectPointsClose(loop, ring.slice(0, -1).map((p) => assemblyPoint(geometry, p)));
+      });
     });
-    expect(attribute(boundaryGroup ?? "", "stroke-width")).toBe("4");
     expect(binding).not.toContain("stroke-dasharray");
     expect(binding).not.toMatch(/GUIDES_NON_PRINTING|ELECTRON_ROUTE|<text\b|<circle/);
     expect(hexColors(binding)).toEqual(["#000000", "#ffffff"]);

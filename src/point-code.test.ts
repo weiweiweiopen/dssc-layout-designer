@@ -105,6 +105,11 @@ function geometryFor(
     ],
     etchPaths: { "glass-6066": [], "glass-6060": [] },
     electronPath: [],
+    fabrication: { activeRegions: [], cellAreasMm2: [], totalActiveMm2: 0, areaCv: 0,
+      coatingClearance: { targetMm: 0, registrationMm: 0, scenarioSpreadMm: 0, insetMm: 0,
+        printedRequiredMm: 0, scenarioRequiredMm: 0, minimumPrintedMm: null, minimumScenarioMm: null,
+        perCell: [], method: "parallel-wall-offset-no-trimming" },
+      sealPrint: [], sealAssembled: [], ports: [], retainedFto: { "glass-6066": [], "glass-6060": [] }, errors: [], sealPrintAreaMm2: 0, volumeSpreadMm: 0, envelopeSpreadMm: 0, minimumChannelMm: 0, minimumPrintedChannelMm: 0, openingScenario: { filmUm: 15, source: "measured-wet-film", volumeSpreadMm: 0, valid: true }, compressionValid: true, isolationRoutes: { "glass-6066": [], "glass-6060": [] }, bleedCheck: { "glass-6066": { count: 0, allReachGlass: true, noPerimeter: true }, "glass-6060": { count: 0, allReachGlass: true, noPerimeter: true } }, terminalCheck: { negativeConnected: false, positiveConnected: false, negativeStripContinuous: false, positiveStripContinuous: false, isolated: false, fullHeightIsolation: false } },
   };
 }
 
@@ -615,6 +620,8 @@ describe("point-code manufacturing validation", () => {
       ...DEFAULT_CONFIG,
       subcellCount: 64,
       bindingWidthMm: 5,
+      glass6060WidthMm: 40,
+      glassHeightMm: 40,
     };
     const geometry = buildGeometry(config);
     const artwork = buildPointCodeArtwork(config, geometry);

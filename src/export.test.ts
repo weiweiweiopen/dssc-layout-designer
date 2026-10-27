@@ -129,7 +129,7 @@ function dxfEntities(dxf: string): DxfEntity[] {
     if (record.code === "0" && record.value === "ENDSEC") break;
     if (
       record.code === "0" &&
-      ["LINE", "LWPOLYLINE", "CIRCLE"].includes(record.value)
+      ["LINE", "LWPOLYLINE", "CIRCLE", "HATCH"].includes(record.value)
     ) {
       if (current) entities.push(current);
       current = { type: record.value, records: [] };
@@ -202,15 +202,6 @@ function declaredDxfLayers(dxf: string): string[] {
   });
 }
 
-function rectPoints(rect: Rect): Point[] {
-  return [
-    { x: rect.x, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y },
-    { x: rect.x + rect.width, y: rect.y + rect.height },
-    { x: rect.x, y: rect.y + rect.height },
-  ];
-}
-
 function platePoint(
   config: DesignConfig,
   geometry: LayoutGeometry,
@@ -225,13 +216,6 @@ function platePoint(
         ? rect.width - localX
         : localX,
     y: point.y - rect.y,
-  };
-}
-
-function assemblyPoint(geometry: LayoutGeometry, point: Point): Point {
-  return {
-    x: point.x - geometry.glass6066.x,
-    y: point.y - geometry.glass6066.y,
   };
 }
 
@@ -293,11 +277,9 @@ function usableScreenRegions(
   geometry: LayoutGeometry,
   plate: PlateId,
 ): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[] }> {
-  const insetMm = Number.isFinite(config.bindingWidthMm)
-    ? Math.max(0, config.bindingWidthMm) / 2
-    : 0;
+  void config;
   return selectedCells(geometry, plate).flatMap((cell) => {
-    const polygon = insetConvexPolygon(cell.polygon, insetMm);
+    const polygon = geometry.fabrication.activeRegions[cell.index];
     return polygon.length >= 3 ? [{ cell, polygon }] : [];
   });
 }
@@ -483,27 +465,15 @@ describe("buildManufacturingDxf", () => {
     }
 
     expect(entitiesOn(entities, "CIRCUIT_REFERENCE")).toHaveLength(
-      geometry.boundaries.length + geometry.activePerimeter.length,
+      geometry.boundaries.length,
     );
     const binding = entitiesOn(entities, "BINDING");
-    expect(binding).toHaveLength(geometry.boundaries.length + 2);
-    expectPointsClose(
-      dxfPolylinePoints(binding[0]),
-      rectPoints(geometry.bindingOuter).map((point) =>
-        assemblyPoint(geometry, point),
-      ),
-    );
-    expectPointsClose(
-      dxfPolylinePoints(binding[1]),
-      rectPoints(geometry.bindingInner).map((point) =>
-        assemblyPoint(geometry, point),
-      ),
-    );
-    geometry.boundaries.forEach((boundary, index) => {
-      expectPointsClose(dxfLinePoints(binding[index + 2]), [
-        assemblyPoint(geometry, boundary.start),
-        assemblyPoint(geometry, boundary.end),
-      ]);
+    expect(binding).toHaveLength(geometry.fabrication.sealPrint.length);
+    binding.forEach((hatch, index) => {
+      expect(hatch.type).toBe("HATCH");
+      expect(entityNumber(hatch, "91")).toBe(geometry.fabrication.sealPrint[index].length);
+      expect(hatch.records.filter((r) => r.code === "93").map((r) => Number(r.value)))
+        .toEqual(geometry.fabrication.sealPrint[index].map((r) => r.length - 1));
     });
   });
 
@@ -511,6 +481,8 @@ describe("buildManufacturingDxf", () => {
     const config = design({
       subcellCount: 64,
       bindingWidthMm: 5,
+      glass6060WidthMm: 40,
+      glassHeightMm: 40,
       text: "A".repeat(64),
       mirrorGlass6060: true,
     });
@@ -625,7 +597,7 @@ describe("buildManufacturingDxf", () => {
     }
   });
 
-  it("preserves every canonical path endpoint and both isolation cuts on each plate", () => {
+  it("preserves every Voronoi and bleed endpoint without a perimeter frame", () => {
     const { config, geometry, pointCodeArtwork } = fixture({
       mirrorGlass6060: true,
     });
@@ -637,9 +609,7 @@ describe("buildManufacturingDxf", () => {
       const lines = entitiesOn(entities, layer);
       const paths = geometry.etchPaths[plate];
       expect(lines).toHaveLength(paths.length);
-      expect(
-        paths.filter((path) => path.source === "terminal-isolation"),
-      ).toHaveLength(2);
+      expect(paths.every((p) => p.source === "electrode-voronoi" || p.source === "voronoi-bleed")).toBe(true);
       paths.forEach((path, index) => {
         expectPointsClose(dxfLinePoints(lines[index]), [
           platePoint(config, geometry, plate, path.start),
@@ -648,15 +618,15 @@ describe("buildManufacturingDxf", () => {
         expect(dxf).toContain(
           `geometry.etchPaths[${plate}][${index}] source=${path.source}`,
         );
-        if (path.source === "terminal-isolation") {
+        if (path.source === "voronoi-bleed") {
           expect(dxf).toContain(
-            `source=terminal-isolation isolationIndex=${String(path.isolationIndex)}`,
+            `source=voronoi-bleed boundaryIndex=${String(path.boundaryIndex)}`,
           );
         }
       });
     }
-    expect(dxf.match(/source=terminal-isolation isolationIndex=/g)).toHaveLength(
-      4,
+    expect(dxf.match(/source=voronoi-bleed /g)).toHaveLength(
+      geometry.etchPaths["glass-6066"].filter((p) => p.source === "voronoi-bleed").length + geometry.etchPaths["glass-6060"].filter((p) => p.source === "voronoi-bleed").length,
     );
   });
 
@@ -775,6 +745,9 @@ interface GalvoPath {
   perimeterIndex?: number;
   pieceIndex?: number;
   isolationIndex?: number;
+  polarity?: "negative" | "positive";
+  glassEdge?: "top" | "bottom" | "left" | "right";
+  sharedSide?: "left" | "right";
   points: [GalvoPoint, GalvoPoint];
 }
 
@@ -801,7 +774,7 @@ function parsedGalvo(config: DesignConfig, geometry: LayoutGeometry): GalvoOutpu
 }
 
 describe("buildGalvoToolpaths", () => {
-  it("emits v3 canonical paths with exact source metadata and DXF endpoint parity", () => {
+  it("emits v4 Voronoi bleed paths with exact source metadata and DXF endpoint parity", () => {
     const { config, geometry, pointCodeArtwork } = fixture({
       mirrorGlass6060: true,
     });
@@ -811,9 +784,9 @@ describe("buildGalvoToolpaths", () => {
       buildManufacturingDxf(config, geometry, pointCodeArtwork),
     );
 
-    expect(output.format).toBe("w-series-dssc-galvo-toolpath-v3");
+    expect(output.format).toBe("w-series-dssc-galvo-toolpath-v4");
     expect(output.units).toBe("mm");
-    expect(output.description).toContain("terminal-isolation");
+    expect(output.description).toContain("voronoi-bleed");
     expect(output.interchange).toEqual({
       neutral: true,
       deviceWireProtocol: false,
@@ -829,14 +802,7 @@ describe("buildGalvoToolpaths", () => {
         plate === "glass-6066" ? "FTO_ETCH_6066" : "FTO_ETCH_6060";
       const dxfPaths = entitiesOn(dxf, dxfLayer);
       expect(paths).toHaveLength(canonical.length);
-      expect(paths.filter((path) => path.source === "terminal-isolation")).toHaveLength(
-        2,
-      );
-      expect(
-        paths
-          .filter((path) => path.source === "terminal-isolation")
-          .map((path) => path.isolationIndex),
-      ).toEqual([0, 1]);
+      expect(paths.filter((path) => path.source === "active-perimeter" || path.source === "terminal-isolation")).toEqual([]);
 
       canonical.forEach((source, pathIndex) => {
         const path = paths[pathIndex];
@@ -854,17 +820,26 @@ describe("buildGalvoToolpaths", () => {
         const sourceKeys =
           source.source === "electrode-voronoi"
             ? ["boundaryIndex", "cells"]
+            : source.source === "voronoi-bleed" ? ["boundaryIndex", "cells", "pieceIndex", "glassEdge", ...(source.sharedSide ? ["sharedSide"] : [])]
             : source.source === "active-perimeter"
               ? ["perimeterIndex", "pieceIndex"]
-              : ["isolationIndex"];
+              : source.source === "contact-strip-isolation" ? ["polarity", "pieceIndex"] : ["isolationIndex"];
         expect(Object.keys(path).sort()).toEqual(
           ["id", "source", "plate", "widthMm", "points", ...sourceKeys].sort(),
         );
-        if (source.source === "electrode-voronoi") {
+        if (source.source === "electrode-voronoi" || source.source === "voronoi-bleed") {
           expect(path.boundaryIndex).toBe(source.boundaryIndex);
           expect(path.cells).toEqual(source.cells);
+          if (source.source === "voronoi-bleed") {
+            expect(path.pieceIndex).toBe(source.pieceIndex);
+            expect(path.glassEdge).toBe(source.glassEdge);
+            expect(path.sharedSide).toBe(source.sharedSide);
+          }
         } else if (source.source === "active-perimeter") {
           expect(path.perimeterIndex).toBe(source.perimeterIndex);
+          expect(path.pieceIndex).toBe(source.pieceIndex);
+        } else if (source.source === "contact-strip-isolation") {
+          expect(path.polarity).toBe(source.polarity);
           expect(path.pieceIndex).toBe(source.pieceIndex);
         } else {
           expect(path.isolationIndex).toBe(source.isolationIndex);
@@ -1033,7 +1008,7 @@ describe("downloadProjectBundle", () => {
       new Uint8Array(await (downloaded as Blob).arrayBuffer()),
     );
     const paths = Object.keys(files);
-    expect(paths).toHaveLength(16);
+    expect(paths).toHaveLength(20);
     expect(paths.filter((path) => path.startsWith("svg-layered/"))).toHaveLength(
       7,
     );
@@ -1059,10 +1034,11 @@ describe("downloadProjectBundle", () => {
     expect(paths.some((path) => /surlyn/i.test(path))).toBe(false);
 
     const project = JSON.parse(strFromU8(files["design.json"]));
-    expect(project.format).toBe("w-series-dssc-project-v4");
-    expect(project.description).toContain("TiO2 regions");
-    expect(project.description).toContain("Demaine-site point knockouts");
-    expect(project.description).toContain("terminal-isolation");
+    expect(project.format).toBe("w-series-dssc-project-v9");
+    expect(project.description).toContain("Active-area-balanced");
+    expect(project.geometry.fabrication.ports.length).toBeGreaterThan(0);
+    expect(paths).toContain("laser-fill/toolpaths.json");
+    expect(paths).toContain("process-estimates.json");
     expect(project.config.electrodeJitter).toBe(config.electrodeJitter);
     expect(project.config.ftoEtchWidthMm).toBe(0.08);
     expect(project.config).toEqual(config);
@@ -1082,9 +1058,9 @@ describe("downloadProjectBundle", () => {
     for (const plate of ["glass-6066", "glass-6060"] as const) {
       expect(
         project.geometry.etchPaths[plate].filter(
-          (path: EtchPath) => path.source === "terminal-isolation",
+          (path: EtchPath) => path.source === "active-perimeter" || path.source === "terminal-isolation",
         ),
-      ).toHaveLength(2);
+      ).toHaveLength(0);
     }
 
     const production6066 = strFromU8(
@@ -1135,7 +1111,7 @@ describe("downloadProjectBundle", () => {
       const etch = strFromU8(files[`svg-production/${filename}`]);
       expect(etch).not.toContain("GUIDES_NON_PRINTING");
       expect(etch).not.toMatch(/font|microcell|data-slot|data-site|glyph/i);
-      expect(etch).toContain("terminal-isolation");
+      expect(etch).toContain("voronoi-bleed");
     }
     expect(strFromU8(files["svg-production/binding-mask.svg"])).toContain(
       'id="BINDING_MASK"',
@@ -1143,33 +1119,24 @@ describe("downloadProjectBundle", () => {
 
     const readme = strFromU8(files["README.txt"]);
     for (const statement of [
-      "串聯電路材料配置",
-      "頂層 TiO2 region mask",
-      "bindingWidthMm/2",
-      "Demaine-site point knockout",
-      "固定半徑 0.03 mm、直徑 0.06 mm",
-      "最小圓心間距為 0.07 mm",
-      "0.01 mm 最小邊緣間隙",
-      "radius 0.03 mm, diameter 0.06 mm",
-      "minimum site center-to-center spacing is 0.07 mm",
-      "0.01 mm edge-to-edge gap",
-      "少於三個頂點",
-      "validatePointCodeArtwork",
-      "blocking error",
-      "不是可閱讀字樣",
-      "也不是文字負片",
+      "active region",
+      "垂直注液",
+      "SOLID HATCH",
+      "開口模型",
+      "process-estimates.json",
+      "laser-fill/",
       "1-bit、1200 DPI TIFF",
       "6060 玻璃製造檔水平鏡射：是",
       "zebra 外露接觸條涵蓋玻璃完整高度",
       "完整跨度",
-      "terminal-isolation",
-      "每片恰好兩條",
+      "voronoi-bleed",
+      "矩形蝕刻框",
       "geometry.etchPaths",
       "binding-mask",
       `bindingWidthMm = ${String(config.bindingWidthMm)} mm`,
       `electrodeJitter = ${String(config.electrodeJitter)}（允許上限 2）`,
       "ftoEtchWidthMm = 0.08 mm（預設 0.08 mm）",
-      "pointCodeArtwork",
+      "fabrication activeRegions",
       "七個完整分層 SVG",
       "校正警告",
     ]) {
@@ -1185,7 +1152,7 @@ describe("downloadProjectBundle", () => {
       /FONT_VORONOI_REFERENCE|FONT_SITES_REFERENCE/,
     );
     expect(JSON.parse(strFromU8(files["fto-galvo-toolpaths.json"])).format).toBe(
-      "w-series-dssc-galvo-toolpath-v3",
+      "w-series-dssc-galvo-toolpath-v4",
     );
 
     expect(progress[0].slice(0, 2)).toEqual([0, 8]);
@@ -1248,7 +1215,7 @@ describe("downloadProjectBundle", () => {
       new Uint8Array(await (downloaded as Blob).arrayBuffer()),
     );
     const paths = Object.keys(files);
-    expect(paths).toHaveLength(24);
+    expect(paths).toHaveLength(28);
     expect(paths.filter((path) => path.startsWith("svg-layered/"))).toHaveLength(
       7,
     );
@@ -1270,6 +1237,7 @@ describe("downloadProjectBundle", () => {
         "design.json",
         "fto-galvo-toolpaths.json",
         "manufacturing-layout.dxf",
+        "process-estimates.json",
       ].sort(),
     );
     expect(progress[0]).toEqual([0, 16]);

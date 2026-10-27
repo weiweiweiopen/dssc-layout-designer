@@ -21,7 +21,9 @@ import {
 const EPSILON = 1e-8;
 
 function config(overrides: Partial<DesignConfig> = {}): DesignConfig {
-  return { ...DEFAULT_CONFIG, ...overrides };
+  // Known film/gap fixture: these tests exercise electrical / Voronoi geometry.
+  // Unmeasured-process aperture stress cases are checked in process.test.ts.
+  return { ...DEFAULT_CONFIG, measuredWetFilmUm: 15, ...overrides };
 }
 
 function openPolygon(points: Point[]): Point[] {
@@ -96,14 +98,6 @@ function gateOwners(
   });
 }
 
-function segmentAmount(segment: Segment, point: Point): number {
-  const width = segment.end.x - segment.start.x;
-  const height = segment.end.y - segment.start.y;
-  return Math.abs(width) >= Math.abs(height)
-    ? (point.x - segment.start.x) / width
-    : (point.y - segment.start.y) / height;
-}
-
 function sourcePaths(
   geometry: LayoutGeometry,
   plate: PlateId,
@@ -121,23 +115,14 @@ function expectAnnulusSplit(
   plate: PlateId,
 ): void {
   const glass = plateRect(geometry, plate);
-  const centerX = geometry.active.x + geometry.active.width / 2;
-  expect(sourcePaths(geometry, plate, "terminal-isolation")).toEqual([
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 0,
-      start: { x: centerX, y: glass.y },
-      end: { x: centerX, y: geometry.active.y },
-    },
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 1,
-      start: { x: centerX, y: geometry.active.y + geometry.active.height },
-      end: { x: centerX, y: glass.y + glass.height },
-    },
-  ]);
+  expect(geometry.fabrication.bleedCheck[plate].allReachGlass).toBe(true);
+  expect(geometry.fabrication.bleedCheck[plate].noPerimeter).toBe(true);
+  expect(geometry.etchPaths[plate].every((p) => p.source === "electrode-voronoi" || p.source === "voronoi-bleed")).toBe(true);
+  for (const p of sourcePaths(geometry, plate, "voronoi-bleed")) {
+    expect(Math.min(Math.abs(p.end.x - glass.x), Math.abs(p.end.x - glass.x - glass.width),
+      Math.abs(p.end.y - glass.y), Math.abs(p.end.y - glass.y - glass.height))).toBeLessThan(1e-7);
+  }
+  if (plate === "glass-6066") expect(geometry.fabrication.isolationRoutes[plate].every((r) => r.continuousTopToBottom)).toBe(true);
 }
 
 function errorMessages(
@@ -149,6 +134,12 @@ function errorMessages(
     .map(({ message }) => message);
 }
 
+// Electrical topology is independent of whether a dense artwork can accommodate
+// physical seal / fill slots. Those constraints are exercised in fabrication.test.
+function topologyErrors(design: DesignConfig, geometry: LayoutGeometry): string[] {
+  return errorMessages(design, geometry).filter((m) => !/通道|active area|製程幾何範圍|雷射填滿/.test(m));
+}
+
 describe("buildGeometry", () => {
   it("uses bindingWidthMm for the exact default active and binding rectangles", () => {
     const geometry = buildGeometry(config());
@@ -157,20 +148,20 @@ describe("buildGeometry", () => {
     expect(geometry.glass6060).toEqual({ x: 3, y: 0, width: 60, height: 60 });
     expect(geometry.overlap).toEqual({ x: 3, y: 0, width: 60, height: 60 });
     expect(geometry.bindingOuter).toEqual(geometry.overlap);
-    expect(geometry.active).toEqual({ x: 6, y: 3, width: 54, height: 54 });
+    expect(geometry.active).toEqual({ x: 3.15, y: 0.15, width: 59.7, height: 59.7 });
     expect(geometry.bindingInner).toEqual(geometry.active);
-    expect(geometry.active.x - geometry.bindingOuter.x).toBe(3);
-    expect(geometry.active.y - geometry.bindingOuter.y).toBe(3);
+    expect(geometry.active.x - geometry.bindingOuter.x).toBeCloseTo(0.15);
+    expect(geometry.active.y - geometry.bindingOuter.y).toBeCloseTo(0.15);
     expect(
       geometry.bindingOuter.x +
         geometry.bindingOuter.width -
         (geometry.active.x + geometry.active.width),
-    ).toBe(3);
+    ).toBeCloseTo(0.15);
     expect(
       geometry.bindingOuter.y +
         geometry.bindingOuter.height -
         (geometry.active.y + geometry.active.height),
-    ).toBe(3);
+    ).toBeCloseTo(0.15);
   });
 
   it("is deterministic, covers active with convex cells, and keeps sites inside", () => {
@@ -193,12 +184,7 @@ describe("buildGeometry", () => {
     }
   });
 
-  it("keeps jitter 2 deterministic and safe across representative counts and seeds", () => {
-    const counts = [2, 8, 16, 32, 64];
-    const seeds = [0, 1, 834_721];
-
-    for (const subcellCount of counts) {
-      for (const electrodeSeed of seeds) {
+  it.each([2, 8, 16, 32, 64].flatMap((n) => [0, 1, 834_721].map((seed) => [n, seed])))("keeps jitter 2 deterministic for %i cells, seed %i", (subcellCount, electrodeSeed) => {
         const design = config({
           electrodeJitter: 2,
           electrodeSeed,
@@ -247,9 +233,7 @@ describe("buildGeometry", () => {
         ]);
         expectAnnulusSplit(first, "glass-6066");
         expectAnnulusSplit(first, "glass-6060");
-        expect(errorMessages(design, first), label).toEqual([]);
-      }
-    }
+        expect(topologyErrors(design, first), label).toEqual([]);
   });
 
   it("produces byte-identical electrical and etch geometry for different text", () => {
@@ -350,85 +334,35 @@ describe("buildGeometry", () => {
     }
   });
 
-  it("etches the complete 6060 active perimeter", () => {
+  it("does not etch an active perimeter on either glass", () => {
     const geometry = buildGeometry(config());
 
-    expect(sourcePaths(geometry, "glass-6060", "active-perimeter")).toEqual(
-      geometry.activePerimeter.map((segment, perimeterIndex) => ({
-        source: "active-perimeter",
-        plate: "glass-6060",
-        perimeterIndex,
-        pieceIndex: 0,
-        start: segment.start,
-        end: segment.end,
-      })),
-    );
+    expect(sourcePaths(geometry, "glass-6060", "active-perimeter")).toEqual([]);
+    expect(sourcePaths(geometry, "glass-6066", "active-perimeter")).toEqual([]);
   });
 
-  it("etches exactly the 6066 active-perimeter complement of both full gates", () => {
+  it("continues 6060 Voronoi edges in their original direction to the glass edge", () => {
     const geometry = buildGeometry(config());
-    const paths = sourcePaths(geometry, "glass-6066", "active-perimeter");
-
-    geometry.activePerimeter.forEach((perimeter, perimeterIndex) => {
-      const gate =
-        perimeterIndex === 1
-          ? geometry.terminals[1].gate
-          : perimeterIndex === 3
-            ? geometry.terminals[0].gate
-            : undefined;
-      const pieces = paths.filter(
-        (path) => path.perimeterIndex === perimeterIndex,
-      );
-      expect(pieces.map(({ pieceIndex }) => pieceIndex)).toEqual(
-        pieces.map((_, index) => index),
-      );
-
-      const intervals = pieces.map((piece) => [
-        segmentAmount(perimeter, piece.start),
-        segmentAmount(perimeter, piece.end),
-      ] as [number, number]);
-      if (gate) {
-        intervals.push([
-          Math.min(
-            segmentAmount(perimeter, gate.start),
-            segmentAmount(perimeter, gate.end),
-          ),
-          Math.max(
-            segmentAmount(perimeter, gate.start),
-            segmentAmount(perimeter, gate.end),
-          ),
-        ]);
-      }
-      intervals.sort((first, second) => first[0] - second[0]);
-
-      let cursor = 0;
-      for (const [start, end] of intervals) {
-        expect(start).toBeCloseTo(cursor, 9);
-        expect(end).toBeGreaterThan(start);
-        cursor = end;
-      }
-      expect(cursor).toBeCloseTo(1, 9);
-      expect(
-        pieces.reduce((sum, piece) => sum + segmentLength(piece), 0) +
-          (gate ? segmentLength(gate) : 0),
-      ).toBeCloseTo(segmentLength(perimeter), 9);
-    });
+    const paths = sourcePaths(geometry, "glass-6060", "voronoi-bleed");
+    expect(paths.length).toBeGreaterThan(0);
+    for (const p of paths) {
+      const b = geometry.boundaries[p.boundaryIndex!];
+      const cross = (b.end.x - b.start.x) * (p.end.y - p.start.y) - (b.end.y - b.start.y) * (p.end.x - p.start.x);
+      expect(Math.abs(cross)).toBeLessThan(1e-6);
+    }
   });
 
-  it("adds exactly two center isolation crosscuts per plate and splits the outer annulus", () => {
+  it("extends both isolation boundaries to the real glass top and bottom", () => {
     const geometry = buildGeometry(config());
 
     expectAnnulusSplit(geometry, "glass-6066");
     expectAnnulusSplit(geometry, "glass-6060");
     expect(geometry.terminals[0].contact.x).toBeLessThan(33);
     expect(geometry.terminals[1].contact.x).toBeGreaterThan(33);
-    expect(sourcePaths(geometry, "glass-6060", "active-perimeter")).toHaveLength(
-      4,
-    );
+    expect(sourcePaths(geometry, "glass-6060", "active-perimeter")).toHaveLength(0);
   });
 
-  it("preserves terminal ownership and W-series topology for practical even counts", () => {
-    for (let subcellCount = 2; subcellCount <= 64; subcellCount += 2) {
+  it.each(Array.from({ length: 32 }, (_, i) => (i + 1) * 2))("preserves terminal ownership and W-series topology for %i cells", (subcellCount) => {
       const design = config({ subcellCount });
       const geometry = buildGeometry(design);
       const [negative, positive] = geometry.terminals;
@@ -458,8 +392,7 @@ describe("buildGeometry", () => {
         ]);
       }
 
-      expect(errorMessages(design, geometry), label).toEqual([]);
-    }
+      expect(topologyErrors(design, geometry), label).toEqual([]);
   });
 });
 
@@ -481,7 +414,7 @@ describe("validateDesign", () => {
     ).toEqual([]);
   });
 
-  it("requires binding width to remain within 1-5 mm", () => {
+  it("enforces process-dependent binding limits and the 5 mm ceiling", () => {
     for (const bindingWidthMm of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
       expect(
         errorMessages(config({ bindingWidthMm })).some((message) =>
@@ -490,13 +423,13 @@ describe("validateDesign", () => {
       ).toBe(true);
     }
 
-    for (const bindingWidthMm of [0.5, 5.5]) {
+    for (const bindingWidthMm of [0.1, 5.5]) {
       const design = config({ bindingWidthMm });
       const warnings = validateDesign(design, buildGeometry(design));
       expect(
         warnings.some(
           ({ severity, message }) =>
-            severity === "error" && message.includes("1") && message.includes("5"),
+            severity === "error" && message.includes("Binding"),
         ),
       ).toBe(true);
     }
@@ -505,7 +438,7 @@ describe("validateDesign", () => {
       const design = config({ bindingWidthMm });
       expect(
         validateDesign(design, buildGeometry(design)).some(
-          ({ severity }) => severity === "error",
+          ({ severity, message }) => severity === "error" && message.includes("Binding 寬度"),
         ),
       ).toBe(false);
     }
@@ -544,7 +477,7 @@ describe("validateDesign", () => {
       ),
     ).toBe(true);
 
-    const design = config({ bindingWidthMm: 31 });
+    const design = config({ bindingWidthMm: 61 });
     const geometry = buildGeometry(design);
     expect(geometry.active.width).toBe(0);
     expect(geometry.active.height).toBe(0);

@@ -1,4 +1,11 @@
 import { Delaunay } from "d3-delaunay";
+import { buildFabricationGeometry, printedSealFootprint, volumeOffsetForFootprint } from "./fabrication-geometry";
+import { sealProcess } from "./process";
+import { buildBleedEtchPaths } from "./etch";
+import { insetConvexPolygon } from "./point-code";
+import { coatingInset } from "./coating";
+import { rectRing, shape } from "./polygons";
+import { buildRetainedFto, checkFtoConnectivity } from "./fto-connectivity";
 
 import type {
   DesignConfig,
@@ -360,6 +367,7 @@ function maximalOwnedSideSpan(
 function sharedPolygonEdge(first: Point[], second: Point[]): Segment | null {
   const firstCount = polygonVertexCount(first);
   const secondCount = polygonVertexCount(second);
+  const shared: Point[] = [];
 
   for (let firstIndex = 0; firstIndex < firstCount; firstIndex += 1) {
     const firstStart = first[firstIndex];
@@ -371,12 +379,20 @@ function sharedPolygonEdge(first: Point[], second: Point[]): Segment | null {
         pointsEqual(firstStart, secondEnd) &&
         pointsEqual(firstEnd, secondStart)
       ) {
-        return { start: firstStart, end: firstEnd };
+        shared.push(firstStart, firstEnd);
       }
     }
   }
 
-  return null;
+  // d3 may split a straight shared boundary at an extra collinear vertex
+  // (notably two-cell layouts). Etching only the first piece leaves a bypass.
+  let span: Segment | null = null;
+  let longest = 0;
+  for (const start of shared) for (const end of shared) {
+    const length = Math.hypot(end.x - start.x, end.y - start.y);
+    if (length > longest) { span = { start, end }; longest = length; }
+  }
+  return span;
 }
 
 function orderedSegment(segment: Segment): Segment {
@@ -572,6 +588,82 @@ function makeCell(
   };
 }
 
+function manufacturablePartition(candidate: VoronoiResult, active: Rect, c: DesignConfig, clearance: number): boolean {
+  if (!(Number.isFinite(c.ftoEtchWidthMm) && c.ftoEtchWidthMm > 0 && Number.isFinite(c.laserSpotMm) && c.laserSpotMm > 0)) return false;
+  const glass6066 = { x: 0, y: 0, width: c.glass6066WidthMm, height: c.glassHeightMm };
+  const glass6060 = { x: (c.glass6066WidthMm - c.glass6060WidthMm) / 2, y: 0, width: c.glass6060WidthMm, height: c.glassHeightMm };
+  const cells = candidate.sites.map((site, i) => makeCell(i, site, candidate.polygons[i]));
+  const overlap = intersectRects(glass6066, glass6060);
+  const terminals = terminalGeometry(glass6066, overlap, active, cells);
+  try {
+    const etchPaths = { "glass-6066": buildBleedEtchPaths("glass-6066", glass6066, active, candidate.boundaries, terminals),
+      "glass-6060": buildBleedEtchPaths("glass-6060", glass6060, active, candidate.boundaries, terminals) };
+    if (Object.values(etchPaths).some((paths) => paths.some((p) => segmentLength(p) < c.laserSpotMm))) return false;
+    const retained = buildRetainedFto(c, { glass6066, glass6060, etchPaths });
+    const regions = candidate.polygons.map((r) => insetConvexPolygon(r, clearance));
+    return checkFtoConnectivity({ cells, terminals }, regions, retained).errors.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Constrained coordinate descent on Voronoi generators. Every accepted move
+ * preserves the Hamiltonian W-series adjacency and terminal side ownership.
+ * The objective uses post-seal active area, not raw Voronoi area. */
+function balanceVoronoi(initial: VoronoiResult, active: Rect, config: DesignConfig): VoronoiResult {
+  const strength = Math.max(0, Math.min(1, config.areaBalance));
+  if (!strength || active.width <= 0 || active.height <= 0 || !Number.isFinite(config.bindingWidthMm) || config.bindingWidthMm < 0) return initial;
+  const process = sealProcess(config);
+  const half = config.bindingWidthMm / 2;
+  const overlap = { x: active.x - half, y: active.y - half, width: active.width + 2 * half, height: active.height + 2 * half };
+  // Use the same opening-film basis as final coating clearance. This first
+  // footprint is a planning estimate; final ports / offset are remeasured later.
+  const planningSpread = (volumeOffsetForFootprint(printedSealFootprint(overlap, initial.polygons, config.bindingWidthMm),
+    shape(rectRing(overlap)), process.openingVolumeRatio) ?? process.openingVolumeSpreadMm ?? 0) + process.allowanceMm;
+  const clearance = coatingInset(config, planningSpread).insetMm;
+  const score = (candidate: VoronoiResult) => {
+    const areas = candidate.polygons.map((r) => polygonArea(insetConvexPolygon(r, clearance)));
+    const mean = areas.reduce((s, a) => s + a, 0) / areas.length;
+    if (!(mean > 0) || Math.min(...areas) <= 0) return Infinity;
+    return areas.reduce((s, a) => s + (a - mean) ** 2, 0) / (areas.length * mean ** 2)
+      - 0.15 * Math.min(...areas) / mean - 0.05 * mean * areas.length / (active.width * active.height);
+  };
+  let best = initial, bestScore = score(initial);
+  // Search can cross a cocircular / tiny-edge intermediate state (notably
+  // jitter=0). Only the best finite-kerf-manufacturable visited layout is output.
+  let feasible = manufacturablePartition(initial, active, config, clearance) ? initial : null;
+  let feasibleScore = feasible ? bestScore : Infinity;
+  const length = Math.min(active.width, active.height) / Math.sqrt(initial.sites.length);
+  for (const factor of [0.12, 0.06, 0.025, 0.01]) {
+    const step = length * factor * strength;
+    for (let sweep = 0; sweep < (best.sites.length <= 16 ? 2 : 1); sweep++) {
+      let improved = false;
+      for (let i = 0; i < best.sites.length; i++) for (const axis of ["x", "y"] as const) {
+        for (const direction of [-1, 1]) {
+          const sites = best.sites.map((p) => ({ ...p }));
+          sites[i][axis] += direction * step;
+          const origin = axis === "x" ? active.x : active.y;
+          const span = axis === "x" ? active.width : active.height;
+          if (sites[i][axis] <= origin + 1e-5 || sites[i][axis] >= origin + span - 1e-5) continue;
+          const candidate = buildVoronoiCandidate(sites, active);
+          if (!candidate) continue;
+          const value = score(candidate);
+          if (value < bestScore - 1e-10) {
+            best = candidate; bestScore = value; improved = true;
+          }
+        }
+      }
+      // Gate whole coordinate-descent sweeps, not every trial move. This keeps
+      // the same exact final connectivity check affordable for 32–64 cells.
+      if (bestScore < feasibleScore && manufacturablePartition(best, active, config, clearance)) {
+        feasible = best; feasibleScore = bestScore;
+      }
+      if (!improved) break;
+    }
+  }
+  return feasible ?? initial;
+}
+
 function terminalGates(
   active: Rect,
   cells: ElectrodeCell[],
@@ -671,114 +763,15 @@ function terminalGeometry(
   ];
 }
 
-function interpolate(start: Point, end: Point, amount: number): Point {
-  return {
-    x: start.x + (end.x - start.x) * amount,
-    y: start.y + (end.y - start.y) * amount,
-  };
-}
-
-function segmentAmount(segment: Segment, point: Point): number {
-  const width = segment.end.x - segment.start.x;
-  const height = segment.end.y - segment.start.y;
-  return Math.abs(width) >= Math.abs(height)
-    ? width === 0
-      ? 0
-      : (point.x - segment.start.x) / width
-    : height === 0
-      ? 0
-      : (point.y - segment.start.y) / height;
-}
-
-function perimeterEtchPaths(
-  plate: PlateId,
-  perimeter: Segment[],
-  terminals: LayoutGeometry["terminals"],
-): EtchPath[] {
-  const paths: EtchPath[] = [];
-
-  perimeter.forEach((segment, perimeterIndex) => {
-    const gate =
-      plate === "glass-6066"
-        ? perimeterIndex === 1
-          ? terminals[1].gate
-          : perimeterIndex === 3
-            ? terminals[0].gate
-            : undefined
-        : undefined;
-    const intervals: Array<[number, number]> = [];
-
-    if (gate && segmentLength(gate) > 0) {
-      const first = clamp(segmentAmount(segment, gate.start), 0, 1);
-      const second = clamp(segmentAmount(segment, gate.end), 0, 1);
-      const gateStart = Math.min(first, second);
-      const gateEnd = Math.max(first, second);
-      if (gateStart > 0) intervals.push([0, gateStart]);
-      if (gateEnd < 1) intervals.push([gateEnd, 1]);
-    } else {
-      intervals.push([0, 1]);
-    }
-
-    intervals.forEach(([startAmount, endAmount], pieceIndex) => {
-      paths.push({
-        source: "active-perimeter",
-        plate,
-        perimeterIndex,
-        pieceIndex,
-        start: interpolate(segment.start, segment.end, startAmount),
-        end: interpolate(segment.start, segment.end, endAmount),
-      });
-    });
-  });
-
-  return paths;
-}
-
 function canonicalEtchPaths(
   plate: PlateId,
   glass: Rect,
   active: Rect,
-  perimeter: Segment[],
+  _perimeter: Segment[],
   boundaries: ElectrodeBoundary[],
   terminals: LayoutGeometry["terminals"],
 ): EtchPath[] {
-  const selectedBoundaries = boundaries.flatMap((boundary, boundaryIndex) =>
-    boundary.etchPlates.includes(plate)
-      ? [
-          {
-            source: "electrode-voronoi" as const,
-            plate,
-            boundaryIndex,
-            cells: [...boundary.cells] as [number, number],
-            start: { ...boundary.start },
-            end: { ...boundary.end },
-          },
-        ]
-      : [],
-  );
-  const centerX = active.x + active.width / 2;
-  const isolation: EtchPath[] = [
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 0,
-      start: { x: centerX, y: glass.y },
-      end: { x: centerX, y: active.y },
-    },
-    {
-      source: "terminal-isolation",
-      plate,
-      isolationIndex: 1,
-      start: { x: centerX, y: active.y + active.height },
-      end: { x: centerX, y: glass.y + glass.height },
-    },
-  ];
-
-  return [
-    ...selectedBoundaries,
-    ...perimeterEtchPaths(plate, perimeter, terminals),
-    ...isolation,
-  ];
+  return buildBleedEtchPaths(plate, glass, active, boundaries, terminals);
 }
 
 export function buildGeometry(config: DesignConfig): LayoutGeometry {
@@ -786,22 +779,23 @@ export function buildGeometry(config: DesignConfig): LayoutGeometry {
     x: 0,
     y: 0,
     width: finiteNonnegative(config.glass6066WidthMm),
-    height: finiteNonnegative(config.glass6066HeightMm),
+    height: finiteNonnegative(config.glassHeightMm),
   };
   const glass6060Width = finiteNonnegative(config.glass6060WidthMm);
-  const glass6060Height = finiteNonnegative(config.glass6060HeightMm);
   const glass6060: Rect = {
     x: (glass6066.width - glass6060Width) / 2,
-    y: (glass6066.height - glass6060Height) / 2,
+    y: 0,
     width: glass6060Width,
-    height: glass6060Height,
+    height: glass6066.height,
   };
   const overlap = intersectRects(glass6066, glass6060);
   const bindingWidth = finiteNonnegative(config.bindingWidthMm);
-  const active = insetRect(overlap, bindingWidth);
+  // Half the printed outer seal is inside the Voronoi frame; the cell inset
+  // supplies the other half. The resulting outer AND inter-cell print widths are B.
+  const active = insetRect(overlap, bindingWidth / 2);
   const cellCount = normalizedCellCount(config.subcellCount);
   const rowCount = chooseOddRowCount(cellCount, active);
-  const voronoi = buildVoronoi(cellCount, rowCount, active, config);
+  const voronoi = balanceVoronoi(buildVoronoi(cellCount, rowCount, active, config), active, config);
   const cells = voronoi.sites.map((site, index) =>
     makeCell(index, site, voronoi.polygons[index]),
   );
@@ -826,7 +820,7 @@ export function buildGeometry(config: DesignConfig): LayoutGeometry {
     ),
   };
 
-  return {
+  const base = {
     glass6066,
     glass6060,
     overlap,
@@ -845,6 +839,7 @@ export function buildGeometry(config: DesignConfig): LayoutGeometry {
       terminals[1].contact,
     ],
   };
+  return { ...base, fabrication: buildFabricationGeometry(config, base) };
 }
 
 function validRect(rect: Rect): boolean {
@@ -912,8 +907,10 @@ function etchPathsEqual(actual: EtchPath, expected: EtchPath): boolean {
   const commonKeys = ["source", "plate", "start", "end"];
   const sourceKeys: Record<EtchPath["source"], string[]> = {
     "electrode-voronoi": ["boundaryIndex", "cells"],
+    "voronoi-bleed": ["boundaryIndex", "cells", "pieceIndex", "glassEdge", "sharedSide"],
     "active-perimeter": ["perimeterIndex", "pieceIndex"],
     "terminal-isolation": ["isolationIndex"],
+    "contact-strip-isolation": ["polarity", "pieceIndex"],
   };
   const allowedKeys = new Set([...commonKeys, ...sourceKeys[expected.source]]);
   if (Object.keys(actual).some((key) => !allowedKeys.has(key))) return false;
@@ -925,11 +922,12 @@ function etchPathsEqual(actual: EtchPath, expected: EtchPath): boolean {
     return false;
   }
 
-  if (expected.source === "electrode-voronoi") {
+  if (expected.source === "electrode-voronoi" || expected.source === "voronoi-bleed") {
     return (
       actual.boundaryIndex === expected.boundaryIndex &&
       actual.cells?.[0] === expected.cells?.[0] &&
-      actual.cells?.[1] === expected.cells?.[1]
+      actual.cells?.[1] === expected.cells?.[1] &&
+      (expected.source !== "voronoi-bleed" || actual.pieceIndex === expected.pieceIndex && actual.glassEdge === expected.glassEdge && actual.sharedSide === expected.sharedSide)
     );
   }
   if (expected.source === "active-perimeter") {
@@ -937,6 +935,9 @@ function etchPathsEqual(actual: EtchPath, expected: EtchPath): boolean {
       actual.perimeterIndex === expected.perimeterIndex &&
       actual.pieceIndex === expected.pieceIndex
     );
+  }
+  if (expected.source === "contact-strip-isolation") {
+    return actual.polarity === expected.polarity && actual.pieceIndex === expected.pieceIndex;
   }
   return actual.isolationIndex === expected.isolationIndex;
 }
@@ -960,12 +961,35 @@ export function validateDesign(
   const add = (severity: DesignWarning["severity"], message: string): void => {
     warnings.push({ severity, message });
   };
+  // Fabrication checks use actual cut widths and printable polygons.
+  geometry.fabrication.errors.forEach((message) => add("error", message));
+  const process = sealProcess(config);
+  process.errors.forEach((message) => add("error", message));
+  if (config.bindingWidthMm < process.minBindingMm || config.bindingWidthMm > process.maxBindingMm) {
+    add("error", `Binding Width 超出此製程幾何範圍 ${process.minBindingMm.toFixed(2)}–${process.maxBindingMm.toFixed(2)} mm。`);
+  }
+  if (config.ftoEtchWidthMm > 5) add("error", "FTO Etch Width 上限為 5 mm。");
+  if (config.laserHatchMm <= 0 || config.laserSpotMm <= 0 || config.laserHatchMm > config.laserSpotMm || config.laserSpotMm > config.ftoEtchWidthMm) {
+    add("error", "雷射需滿足 0 < hatch ≤ spot ≤ FTO Etch Width，才能填滿且不超出切除區。");
+  }
+  if (Object.values(geometry.etchPaths).some((paths) => paths.some((s) => segmentLength(s) < config.laserSpotMm))) {
+    add("error", "至少一段蝕刻線短於光斑，雷射填滿會超出名義端點；請縮小光斑或調整 seed / jitter。");
+  }
+  for (const [key, value] of Object.entries(config)) {
+    if (typeof value === "number" && !Number.isFinite(value)) add("error", `${key} 必須是有限數值。`);
+  }
 
   if (!validRect(geometry.glass6066)) {
     add("error", "6066 玻璃的寬高必須是有限且大於 0 的數值。");
   }
   if (!validRect(geometry.glass6060)) {
     add("error", "6060 玻璃的寬高必須是有限且大於 0 的數值。");
+  }
+  if (config.glass6066WidthMm <= config.glass6060WidthMm) {
+    add("error", "Bigger Electrode W 必須大於 Smaller Electrode W，才能在左右兩側保留斑馬條接觸區。");
+  }
+  if (geometry.glass6066.height !== config.glassHeightMm || geometry.glass6060.height !== config.glassHeightMm || geometry.glass6060.y !== 0) {
+    add("error", "兩片電極必須使用同一 Shared Glass Height，並上下齊平。");
   }
   if (!validRect(geometry.overlap)) {
     add("error", "兩片玻璃的重疊區必須具有有限且大於 0 的寬高。");
@@ -981,16 +1005,16 @@ export function validateDesign(
     Number.isFinite(config.bindingWidthMm) && config.bindingWidthMm > 0;
   if (!validBindingWidth) {
     add("error", "Binding 寬度必須是有限且大於 0 的數值。");
-  } else if (config.bindingWidthMm < 1 || config.bindingWidthMm > 5) {
+  } else if (config.bindingWidthMm < process.minBindingMm || config.bindingWidthMm > 5) {
     add(
       "error",
-      `Binding 寬度必須介於 1 至 5 mm；目前為 ${String(config.bindingWidthMm)} mm。`,
+      `Binding 寬度必須介於 ${process.minBindingMm.toFixed(2)} 至 5 mm；目前為 ${String(config.bindingWidthMm)} mm。`,
     );
   }
 
   const expectedActive = insetRect(
     geometry.overlap,
-    finiteNonnegative(config.bindingWidthMm),
+    finiteNonnegative(config.bindingWidthMm) / 2,
   );
   if (
     !rectsEqual(geometry.bindingOuter, geometry.overlap) ||
@@ -999,7 +1023,7 @@ export function validateDesign(
   ) {
     add(
       "error",
-      "Binding 外框、內框與有效區必須完全由重疊區及 bindingWidthMm 決定。",
+      "Binding 外框為玻璃交集，Voronoi / FTO frame 必須內縮 bindingWidthMm/2，印膠腔室再內縮另一半；不可重複加寬。",
     );
   }
 
@@ -1214,7 +1238,7 @@ export function validateDesign(
   ) {
     add(
       "error",
-      "每片玻璃的 canonical etchPaths 必須依序包含選定電極邊界、指定有效區周界及恰好兩條端子隔離切線。",
+      "canonical etchPaths 只能包含選定的Voronoi邊界與端點出血延伸；不可附加周界蝕刻框，且必須保留6066端點引出。",
     );
   }
 
