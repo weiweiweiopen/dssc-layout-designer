@@ -23,6 +23,8 @@ npm run preview -- --host 127.0.0.1
 
 GitHub Actions builds from `main`, runs the unit tests and publishes `dist/` through GitHub Pages. The workflow is `.github/workflows/pages.yml`; repository **Settings → Pages → Source** uses **GitHub Actions**. Relative Vite asset paths support the `/dssc-layout-designer/` project URL and the local macOS server.
 
+On shared CI runners the complete test suite runs sequentially with a 30-second per-test budget for the 60–64-cell numerical cases.
+
 Browser/export verification against the public page:
 
 ```sh
