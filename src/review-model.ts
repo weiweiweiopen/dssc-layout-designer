@@ -1,5 +1,7 @@
 import type { DesignConfig, LayoutGeometry, PlateId, PolygonSet, Rect } from "./model";
 import { zebraContactRegions } from "./contacts";
+import { cellCoating } from "./artwork-source";
+import { materialForPlate } from "./materials";
 
 // Review settings deliberately live outside DesignConfig: appearance is not a
 // measured optical model, an electrical input, or production artwork.
@@ -15,6 +17,7 @@ export const DYE_PRESETS = {
 } as const;
 export type DyeId = keyof typeof DYE_PRESETS;
 export type ReviewKind = "glass" | "fto" | "tio2" | "pt" | "seal" | "contacts";
+export type ReviewBackground = "transparent" | "dark" | "light";
 export interface ReviewSettings {
   biggerDye: DyeId;
   smallerDye: DyeId;
@@ -29,16 +32,19 @@ export interface ReviewSettings {
   glass: boolean;
   fto: boolean;
   coatings: boolean;
+  tio2: boolean;
+  pt: boolean;
   seal: boolean;
   contacts: boolean;
   labels: boolean;
+  background: ReviewBackground;
 }
 export const DEFAULT_REVIEW_SETTINGS: ReviewSettings = {
   biggerDye: "burgundy", smallerDye: "burgundy",
   biggerColor: "#812f40", smallerColor: "#812f40",
   glassThicknessMm: 2.2, thinLayerScale: 40, explodeMm: 0,
   orthographic: false, bigger: true, smaller: true,
-  glass: true, fto: true, coatings: true, seal: true, contacts: true, labels: true,
+  glass: true, fto: true, coatings: true, tio2: true, pt: true, seal: true, contacts: true, labels: true, background: "transparent",
 };
 
 export function parseReviewSettings(raw: string | null): ReviewSettings {
@@ -46,6 +52,7 @@ export function parseReviewSettings(raw: string | null): ReviewSettings {
   try {
     const parsed = JSON.parse(raw ?? "null");
     if (!parsed || typeof parsed !== "object") return result;
+    if (["transparent", "dark", "light"].includes(parsed.background)) result.background = parsed.background;
     for (const key of Object.keys(result) as Array<keyof ReviewSettings>) {
       if (typeof result[key] === "boolean" && typeof parsed[key] === "boolean") {
         Object.assign(result, { [key]: parsed[key] });
@@ -88,8 +95,8 @@ export function buildReviewFootprints(geometry: LayoutGeometry, compression: boo
     result.push({ id: `${plate}-fto`, kind: "fto", plate, polygons: geometry.fabrication.retainedFto[plate] });
     for (const kind of ["tio2", "pt"] as const) {
       result.push({ id: `${plate}-${kind}`, kind, plate,
-        polygons: geometry.cells.filter((cell) => (plate === "glass-6066" ? cell.glass6066Material : cell.glass6060Material) === kind)
-          .map((cell) => [geometry.fabrication.activeRegions[cell.index]]).filter(([ring]) => ring.length >= 3) });
+        polygons: geometry.cells.filter((cell) => materialForPlate(cell, plate) === kind)
+          .flatMap((cell) => cellCoating(geometry.fabrication, cell.index)) });
     }
   }
   result.push({ id: "ab-313", kind: "seal", polygons: compression ? geometry.fabrication.sealAssembled : geometry.fabrication.sealPrint });

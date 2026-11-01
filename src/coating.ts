@@ -51,3 +51,19 @@ export function minimumSealGap(region: Point[], seal: PolygonSet, segments = bou
   }
   return Number.isFinite(best) ? Math.sqrt(best) : null;
 }
+
+/** Patterned coatings may contain multiple components and glue-filled holes. */
+export function minimumShapeSealGap(regions: PolygonSet, seal: PolygonSet): number | null {
+  if (!regions.length || !seal.length) return null;
+  if (setArea(intersect(regions, seal)) > 1e-8) return 0;
+  const edges = boundarySegments(seal);
+  let best = Infinity;
+  for (const { start: a, end: b } of boundarySegments(regions)) for (const { start: c, end: d } of edges) {
+    const dx = Math.max(0, Math.min(a.x, b.x) - Math.max(c.x, d.x), Math.min(c.x, d.x) - Math.max(a.x, b.x));
+    const dy = Math.max(0, Math.min(a.y, b.y) - Math.max(c.y, d.y), Math.min(c.y, d.y) - Math.max(a.y, b.y));
+    if (dx * dx + dy * dy >= best) continue;
+    if (dx === 0 && dy === 0 && cross(a, b, c) * cross(a, b, d) <= 0 && cross(c, d, a) * cross(c, d, b) <= 0) return 0;
+    best = Math.min(best, pointSegmentSquared(a, c, d), pointSegmentSquared(b, c, d), pointSegmentSquared(c, a, b), pointSegmentSquared(d, a, b));
+  }
+  return Number.isFinite(best) ? Math.sqrt(best) : null;
+}

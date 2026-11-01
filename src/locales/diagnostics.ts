@@ -3,6 +3,17 @@ import type { Locale } from "../i18n";
 /** Boundary catalog: canonical engine strings stay untouched in design/export
  * data. Known diagnostics resolve to stable codes and captured values for UI. */
 export const fixedDiagnostics = {
+  "pattern-convergence": ["圖案補膠與流道補償尚未收斂，請調整實測濕膜、間距或簡化圖案。", "Pattern adhesive/channel compensation has not converged. Adjust measured film, clearance or artwork complexity."],
+  "pattern-volume": ["圖案補膠的體積超過指定間隙可容納範圍；請填入實測濕膜或調整補膠／製程。未知滿載情境不能視為已通過。", "Pattern adhesive volume exceeds the specified gap capacity. Provide measured wet film or adjust adhesive/process inputs; an unknown screen-charge scenario is not a pass."],
+  "pattern-nominal-volume": ["圖案補膠的名義體積無法在玻璃間隙內容納。", "The nominal patterned-adhesive volume cannot fit inside the glass gap."],
+  "pattern-empty-cell": ["至少一個圖案子電池沒有有效塗層。請降低串聯數或重新平衡分區。", "At least one patterned subcell has no active coating. Reduce series count or rebalance partitions."],
+  "pattern-clearance": ["圖案塗層到補膠的安全間距不足。", "Patterned coating-to-adhesive safety clearance is insufficient."],
+  "pattern-port": ["圖案補膠後的至少一個注液開口已閉合或小於要求淨寬。", "A fill opening after patterned adhesive growth is closed or below the requested clearance."],
+  "pattern-flow": ["圖案的部分腔室／塗層分量沒有同時連到上方注液及下方排氣，或通道淨寬不足。", "Some patterned chambers/coating fragments lack both top-fill and bottom-vent access, or their channels are too narrow."],
+  "pattern-source": ["圖案資料無效或超過可處理的範圍，請回 Studio 重新移交。", "Artwork data is invalid or exceeds the supported geometry limits. Return to Studio and transfer it again."],
+  "pattern-export": ["圖案製版尚未通過幾何／流道／製程檢查，不能匯出製造包。", "Pattern fabrication has not passed geometry, flow or process checks; manufacturing export is blocked."],
+  "pattern-missing-trial": ["此圖案暫存已不存在；請回 Studio 重新送出。", "This artwork trial is no longer stored. Return to Studio and send it again."],
+  "pattern-search-none": ["沒有可建立的圖案串聯配置，請減少目標電壓／子電池數或簡化圖案。", "No patterned series configuration could be built. Reduce target voltage/cell count or simplify the artwork."],
   "mesh-wire": ["網版線徑必須小於 mesh pitch。", "Screen wire diameter must be smaller than the mesh pitch."],
   "bead-percentiles": ["玻璃珠 D90 不可小於 D50。", "Bead D90 must not be smaller than D50."],
   "bead-passage": ["網版開目小於 3 × 玻璃珠 D90，可能濾珠／堵網。", "Screen aperture is below 3 × bead D90; beads may be filtered out or clog the mesh."],
@@ -62,6 +73,9 @@ export const fixedDiagnostics = {
 } as const;
 
 const dynamicDiagnostics: Array<{ code: string; pattern: RegExp; english: (...values: string[]) => string; chinese?: (...values: string[]) => string }> = [
+  { code: "pattern-fill-anchor", pattern: /^圖案 cell (\d+) 缺少可用的注液／排氣接點。$/, english: (n) => `Pattern cell ${n} has no usable fill/vent anchor.` },
+  { code: "pattern-chambers", pattern: /^圖案 cell (\d+) 的腔室過多，請簡化圖案。$/, english: (n) => `Pattern cell ${n} has too many chambers; simplify the artwork.` },
+  { code: "pattern-fto-island", pattern: /^(glass-6066|glass-6060) 圖案 cell (\d+) 的塗層分量未完整連到正確 FTO 導體島。$/, english: (plate, n) => `${plate}: not all coating fragments of patterned cell ${n} belong to the correct FTO island.` },
   { code: "underfill", pattern: /^濕膜 (.+?) µm 小於假設間隙 (.+?) µm：膠量不足，壓合孔寬預測不成立；不可將它解讀成零擴散。$/, english: (film, gap) => `Wet film ${film} µm is below the assumed ${gap} µm gap: adhesive underfill invalidates pressed-aperture prediction; do not interpret it as zero growth.` },
   { code: "binding-range", pattern: /^Binding Width 超出此製程幾何範圍 (.+?)–(.+?) mm。$/, english: (lo, hi) => `Binding Width is outside this process/geometry range: ${lo}–${hi} mm.` },
   { code: "binding-limit", pattern: /^Binding 寬度必須介於 (.+?) 至 5 mm；目前為 (.+?) mm。$/, english: (lo, value) => `Binding Width must be between ${lo} and 5 mm; current value is ${value} mm.` },

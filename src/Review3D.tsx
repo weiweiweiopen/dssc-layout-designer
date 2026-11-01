@@ -1,14 +1,15 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentRef } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { Html, OrbitControls, OrthographicCamera, PerspectiveCamera } from "@react-three/drei";
-import { DoubleSide, MOUSE, OrthographicCamera as ThreeOrthographicCamera, PerspectiveCamera as ThreePerspectiveCamera, Vector3 } from "three";
+import { DoubleSide, EdgesGeometry, MOUSE, OrthographicCamera as ThreeOrthographicCamera, PerspectiveCamera as ThreePerspectiveCamera, Vector3 } from "three";
 import type { DesignConfig, LayoutGeometry } from "./model";
 import { useI18n } from "./i18n";
 import type { UiKey } from "./locales/en";
 import { Help } from "./Help";
 import { buildReviewFootprints, DEFAULT_REVIEW_SETTINGS, DYE_PRESETS, reviewDyeColor, reviewStack,
-  type DyeId, type ReviewFootprint, type ReviewSettings } from "./review-model";
+  type DyeId, type ReviewBackground, type ReviewFootprint, type ReviewSettings } from "./review-model";
 import { reviewMeshGeometry } from "./review-shapes";
+import { ReviewProbe } from "./ReviewProbe";
 
 type View = "iso" | "top" | "front" | "side";
 interface ViewCommand { view: View | "current"; revision: number }
@@ -39,11 +40,10 @@ function CameraRig({ width, height, minZ, maxZ, command, host }: {
     const orbit = controls.current;
     if (!orbit || size.width <= 0 || size.height <= 0) return;
     const previous = lastFit.current;
-    // Translation can change toolbar/footer height by a pixel. Preserve the
-    // exact user pose; still reframe for a substantial viewport or model change.
+    // A translated / expanded material toolbar must not reset the user's pose.
+    // Cameras update aspect/frustum on resize; Fit explicitly reframes the view.
     if (previous && previous.camera === camera && previous.command === command
-      && previous.width === width && previous.height === height && previous.minZ === minZ && previous.maxZ === maxZ
-      && Math.abs(previous.viewportWidth - size.width) <= 8 && Math.abs(previous.viewportHeight - size.height) <= 8) return;
+      && previous.width === width && previous.height === height && previous.minZ === minZ && previous.maxZ === maxZ) return;
     lastFit.current = { camera, command, width, height, minZ, maxZ, viewportWidth: size.width, viewportHeight: size.height };
     if (lastCommand.current !== command && command.view !== "current") direction.current.set(...DIRECTIONS[command.view]).normalize();
     lastCommand.current = command;
@@ -85,12 +85,19 @@ function LayerMesh({ layer, geometry, z, depth, settings }: {
   }, depth), [layer.polygons, geometry.glass6066, depth]);
   useEffect(() => () => mesh.dispose(), [mesh]);
   const kind = layer.kind;
-  const color = kind === "glass" ? "#bbd9da" : kind === "fto" ? "#91b5bf"
-    : kind === "tio2" ? reviewDyeColor(settings, layer.plate!) : kind === "pt" ? "#4c5159"
+  const clear = kind === "glass" || kind === "fto";
+  const edges = useMemo(() => clear ? new EdgesGeometry(mesh, 30) : null, [clear, mesh]);
+  useEffect(() => () => edges?.dispose(), [edges]);
+  // A transparent conductor / glass substrate is not a gray material mask.
+  // Draw only its boundaries: no lit, tinted faces over empty coating / seal gaps.
+  if (clear) return <lineSegments name={layer.id} geometry={edges!} position={[0, 0, z]}>
+    <lineBasicMaterial color="#a8b0b8" opacity={kind === "glass" ? 0.28 : 0.2} transparent depthWrite={false} toneMapped={false} />
+  </lineSegments>;
+  const color = kind === "tio2" ? reviewDyeColor(settings, layer.plate!) : kind === "pt" ? "#4c5159"
     : kind === "seal" ? "#18191c" : layer.id === "negative" ? "#69c6e1" : "#e9ae62";
-  const opacity = kind === "glass" ? 0.055 : kind === "fto" ? 0.06 : kind === "pt" ? 0.32 : kind === "tio2" ? 0.9 : kind === "contacts" ? 0.9 : 1;
-  return <mesh geometry={mesh} position={[0, 0, z]} renderOrder={kind === "glass" ? 3 : kind === "contacts" ? 2 : 0}>
-    <meshStandardMaterial color={color} roughness={kind === "glass" ? 0.18 : 0.65}
+  const opacity = kind === "pt" ? 0.32 : kind === "tio2" ? 0.9 : kind === "contacts" ? 0.9 : 1;
+  return <mesh name={layer.id} userData={{ reviewLayerId: layer.id }} geometry={mesh} position={[0, 0, z]} renderOrder={kind === "contacts" ? 2 : 0}>
+    <meshStandardMaterial color={color} roughness={0.65}
       metalness={kind === "pt" ? 0.2 : 0} opacity={opacity} transparent={opacity < 1}
       depthWrite={opacity === 1} side={DoubleSide} forceSinglePass />
   </mesh>;
@@ -110,10 +117,10 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
   const change = <K extends keyof ReviewSettings>(key: K, value: ReviewSettings[K]) => onChange({ ...settings, [key]: value });
   const visible = (layer: ReviewFootprint) => {
     if (layer.plate === "glass-6066" && !settings.bigger || layer.plate === "glass-6060" && !settings.smaller) return false;
-    return layer.polygons.length > 0 && (layer.kind === "tio2" || layer.kind === "pt" ? settings.coatings : settings[layer.kind]);
+    return layer.polygons.length > 0 && (layer.kind === "tio2" || layer.kind === "pt" ? settings.coatings && settings[layer.kind] : settings[layer.kind]);
   };
   const setView = (view: View | "current") => setCommand((current) => ({ view, revision: current.revision + 1 }));
-  const toggle = (key: "bigger" | "smaller" | "glass" | "fto" | "coatings" | "seal" | "contacts" | "labels", label: UiKey) =>
+  const toggle = (key: "bigger" | "smaller" | "glass" | "fto" | "coatings" | "tio2" | "pt" | "seal" | "contacts" | "labels", label: UiKey) =>
     <label key={key} className="review-checkbox"><input type="checkbox" data-review-toggle={key} checked={settings[key]}
       onChange={(event) => change(key, event.target.checked)} />{t(label)}</label>;
   const dyeSelect = (plate: "bigger" | "smaller") => {
@@ -140,12 +147,12 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
         <button type="button" data-testid="review-projection" aria-pressed={settings.orthographic}
           onClick={() => change("orthographic", !settings.orthographic)}>{t(settings.orthographic ? "reviewOrthographic" : "reviewPerspective")}</button>
       </div>
-      <div ref={host} className="review-canvas" data-testid="review-canvas" data-state={ready ? "ready" : "loading"}
+      <div ref={host} className={`review-canvas review-background-${settings.background}`} data-testid="review-canvas" data-background={settings.background} data-state={ready ? "ready" : "loading"}
         data-layer-count={footprints.filter(visible).length}
         onContextMenu={(event) => event.preventDefault()}>
-        <Canvas frameloop="demand" dpr={[1, 2]} gl={{ antialias: true, alpha: false }}
-          onCreated={() => setReady(true)} fallback={<div className="review-placeholder">{t("reviewUnavailable")}</div>}>
-          <color attach="background" args={["#292d34"]} />
+        <Canvas frameloop="demand" dpr={[1, 2]} gl={{ antialias: true, alpha: true }}
+          onCreated={({ gl }) => { gl.setClearColor("#000000", 0); setReady(true); }} fallback={<div className="review-placeholder">{t("reviewUnavailable")}</div>}>
+          {settings.background !== "transparent" && <color attach="background" args={[settings.background === "dark" ? "#292d34" : "#ffffff"]} />}
           {settings.orthographic
             ? <OrthographicCamera makeDefault position={[100, -115, 100]} up={[0, 0, 1]} near={0.01} far={2000} />
             : <PerspectiveCamera makeDefault fov={38} position={[100, -115, 100]} up={[0, 0, 1]} near={0.01} far={2000} />}
@@ -153,8 +160,8 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
           <hemisphereLight args={["#e5edff", "#68717d", 0.7]} />
           <directionalLight position={[40, -70, 120]} intensity={2} />
           <directionalLight position={[-80, 50, 30]} intensity={0.5} />
-          <gridHelper args={[Math.ceil(Math.max(bigger.width, bigger.height) / 10) * 20, Math.ceil(Math.max(bigger.width, bigger.height) / 10) * 2, "#555c66", "#3c434c"]}
-            rotation={[Math.PI / 2, 0, 0]} position={[0, 0, stack.minZ - 0.5]} />
+          {settings.background === "dark" && <gridHelper args={[Math.ceil(Math.max(bigger.width, bigger.height) / 10) * 20, Math.ceil(Math.max(bigger.width, bigger.height) / 10) * 2, "#555c66", "#3c434c"]}
+            rotation={[Math.PI / 2, 0, 0]} position={[0, 0, stack.minZ - 0.5]} />}
           {footprints.filter(visible).map((layer) => <LayerMesh key={layer.id} layer={layer} geometry={geometry}
             {...stack.position(layer)} settings={settings} />)}
           {settings.labels && <>
@@ -172,6 +179,8 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
               ]}><b className={`review-contact-label ${terminal.polarity}`}>{terminal.polarity === "negative" ? "−" : "+"}</b></Html>)}
           </>}
           <CameraRig width={bigger.width} height={bigger.height} minZ={stack.minZ} maxZ={stack.maxZ} command={command} host={host} />
+          {new URLSearchParams(window.location.search).get("review-debug") === "1" && <ReviewProbe host={host} footprints={footprints} geometry={geometry}
+            referenceZ={stack.position(footprints.find((f) => f.kind === "seal")!).z + stack.position(footprints.find((f) => f.kind === "seal")!).depth / 2}/>}
         </Canvas>
       </div>
       <div className="review-navigation">{t("reviewNavigation")}<br /><small>{t("reviewAlternateNavigation")}</small></div>
@@ -180,6 +189,15 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
       <h2>{t("reviewAppearance")}</h2>
       {dyeSelect("bigger")}{dyeSelect("smaller")}
       <small className="review-note">{t("reviewAppearanceNote")}</small>
+      <Help as="label" className="review-background-control" content={`${t("reviewBackgroundHelp")} ${t("reviewClearanceHelp", {
+        growth: geometry.fabrication.coatingClearance.scenarioSpreadMm.toFixed(3), safety: config.coatingSafetyGapMm.toFixed(3), registration: config.registrationMm.toFixed(3),
+      })}`}>
+        <span>{t("reviewBackground")}</span>
+        <select data-testid="review-background" value={settings.background} onChange={(event) => change("background", event.target.value as ReviewBackground)}>
+          <option value="transparent">{t("reviewBackgroundTransparent")}</option><option value="dark">{t("reviewBackgroundDark")}</option><option value="light">{t("reviewBackgroundLight")}</option>
+        </select>
+      </Help>
+      <small className="review-note">{t("reviewClearSpaceNote")}</small>
       <h2>{t("reviewStack")}</h2>
       <Help as="label" className="review-range" content={t("reviewExplodeHelp")}>
         <span>{t("reviewExplode")} <output>{settings.explodeMm.toFixed(1)} mm</output></span>
@@ -206,7 +224,8 @@ export default function Review3D({ config, geometry, compressionEnvelope, settin
       <div className="review-toggles">
         {toggle("bigger", "reviewBigger")}{toggle("smaller", "reviewSmaller")}
         {toggle("glass", "reviewGlass")}{toggle("fto", "Retained FTO")}
-        {toggle("coatings", "reviewCoatings")}{toggle("seal", "reviewSeal")}
+         {toggle("coatings", "reviewCoatings")}
+         {toggle("tio2", "reviewTiO2Paste")}{toggle("pt", "reviewPtPaste")}{toggle("seal", "reviewSeal")}
         {toggle("contacts", "± Zebra contact FTO")}{toggle("labels", "reviewLabels")}
       </div>
       <button type="button" className="review-reset" data-testid="review-reset" onClick={() => {

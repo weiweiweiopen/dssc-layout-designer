@@ -1,5 +1,17 @@
 # Third-Party Notices
 
+## Type × Geometry Studio
+
+OpenType.js (MIT) parses local font contours. Paper.js (MIT) flattens their
+Bézier paths; Clipper resolves the resulting polygon regions and holes.
+Bundled Latin WOFF assets for Anybody (Tyler Finck), Anton (Vernon Adams) and
+Fraunces (Undercase Type) are supplied by their `@fontsource/*` packages under
+the SIL Open Font License 1.1. Package licenses, including font copyright
+notices, are collected in `DEPENDENCY_LICENSES.txt` and distributed with the
+build. No artwork, proprietary font files or characters from the visual
+reference sites are included. Imported user fonts are stored only in that
+user's local Studio recipe.
+
 ## 3D viewer
 
 Three.js, React Three Fiber and Drei provide the local WebGL review. Installed

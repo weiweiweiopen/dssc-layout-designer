@@ -5,6 +5,8 @@ import {
 import { laserFillExport, laserFillSvg } from "./laser";
 import { electricalEstimate, sealProcess } from "./process";
 import { zebraContactRegions } from "./contacts";
+import { cellCoating } from "./artwork-source";
+import { materialForPlate, pasteAssignment } from "./materials";
 import {
   POINT_CODE_MIN_GAP_MM,
   POINT_CODE_RADIUS_MM,
@@ -15,8 +17,9 @@ import {
   type Point,
   type PointCodeArtwork,
   type Rect,
+  type PolygonSet,
 } from "./model";
-import type { SvgAsset } from "./svg";
+import { buildFabricationAssets, type SvgAsset } from "./svg";
 
 type ProgressCallback = (
   completed: number,
@@ -45,6 +48,8 @@ const DXF_LAYERS = [
 const SCREEN_ASSET_IDS = new Set([
   "screen-glass-6066-tio2",
   "screen-glass-6060-tio2",
+  "screen-glass-6066-pt",
+  "screen-glass-6060-pt",
 ]);
 const PRODUCTION_ASSET_IDS = new Set([
   "screen-glass-6066-tio2",
@@ -52,6 +57,8 @@ const PRODUCTION_ASSET_IDS = new Set([
   "fto-etch-glass-6066",
   "fto-etch-glass-6060",
   "binding-mask",
+  "screen-glass-6066-pt",
+  "screen-glass-6060-pt",
 ]);
 
 function errorMessage(error: unknown): string {
@@ -282,18 +289,26 @@ function selectedScreenRegions(
   config: DesignConfig,
   geometry: LayoutGeometry,
   plate: PlateId,
-): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[] }> {
+  material: "tio2" | "pt" = "tio2",
+): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[][] }> {
   void config;
   return geometry.cells.flatMap((cell) => {
-    const isTio2 =
-      plate === "glass-6066"
-        ? cell.glass6066Material === "tio2"
-        : cell.glass6060Material === "tio2";
-    if (!isTio2) return [];
-
-    const polygon = geometry.fabrication.activeRegions[cell.index];
-    return polygon.length >= 3 ? [{ cell, polygon }] : [];
+    const isTio2 = materialForPlate(cell, plate) === "tio2";
+    if (isTio2 !== (material === "tio2")) return [];
+    return cellCoating(geometry.fabrication, cell.index).map((polygon) => ({ cell, polygon }));
   });
+}
+
+function appendSolidHatch(output: string[], layer: string, polygon: PolygonSet[number], map: CoordinateMap) {
+  appendDxfPair(output, 0, "HATCH"); appendDxfPair(output, 100, "AcDbEntity"); appendDxfPair(output, 8, layer); appendDxfPair(output, 100, "AcDbHatch");
+  for (const [code, value] of [[10, 0], [20, 0], [30, 0], [210, 0], [220, 0], [230, 1], [2, "SOLID"], [70, 1], [71, 0], [91, polygon.length]] as const) appendDxfPair(output, code, value);
+  polygon.forEach((ring, index) => {
+    const points = openRing(ring);
+    for (const [code, value] of [[92, index === 0 ? 3 : 2], [72, 0], [73, 1], [93, points.length]] as const) appendDxfPair(output, code, value);
+    points.forEach((p) => { const v = map(p); appendDxfPair(output, 10, dxfNumber(v.x)); appendDxfPair(output, 20, dxfNumber(v.y)); });
+    appendDxfPair(output, 97, 0);
+  });
+  appendDxfPair(output, 75, 0); appendDxfPair(output, 76, 1); appendDxfPair(output, 98, 0);
 }
 
 function dxfEtchPathComment(path: EtchPath, pathIndex: number): string {
@@ -322,6 +337,7 @@ export function buildManufacturingDxf(
   const output: string[] = [];
   const width = Math.max(geometry.glass6066.width, geometry.glass6060.width);
   const height = Math.max(geometry.glass6066.height, geometry.glass6060.height);
+  const layers = [...DXF_LAYERS, "SCREEN_6066_PT_REGIONS", "SCREEN_6060_PT_REGIONS"];
 
   appendDxfPair(output, 0, "SECTION");
   appendDxfPair(output, 2, "HEADER");
@@ -346,7 +362,7 @@ export function buildManufacturingDxf(
   appendDxfPair(output, 0, "TABLE");
   appendDxfPair(output, 2, "LAYER");
   appendDxfPair(output, 100, "AcDbSymbolTable");
-  appendDxfPair(output, 70, DXF_LAYERS.length + 1);
+  appendDxfPair(output, 70, layers.length + 1);
   appendDxfPair(output, 0, "LAYER");
   appendDxfPair(output, 100, "AcDbSymbolTableRecord");
   appendDxfPair(output, 100, "AcDbLayerTableRecord");
@@ -354,7 +370,7 @@ export function buildManufacturingDxf(
   appendDxfPair(output, 70, 0);
   appendDxfPair(output, 62, 7);
   appendDxfPair(output, 6, "CONTINUOUS");
-  DXF_LAYERS.forEach((layer, index) => {
+  layers.forEach((layer, index) => {
     appendDxfPair(output, 0, "LAYER");
     appendDxfPair(output, 100, "AcDbSymbolTableRecord");
     appendDxfPair(output, 100, "AcDbLayerTableRecord");
@@ -369,6 +385,7 @@ export function buildManufacturingDxf(
   appendDxfPair(output, 0, "SECTION");
   appendDxfPair(output, 2, "ENTITIES");
   appendDxfPair(output, 999, "Units: millimetres.");
+  appendDxfPair(output, 999, "Paste assignments: TIO2_REGIONS = 18NR-T; PT_REGIONS = PT-1. W-series order swaps these between bigger and smaller electrodes.");
   appendDxfPair(
     output,
     999,
@@ -421,7 +438,11 @@ export function buildManufacturingDxf(
       selectedRegions.map(({ cell }) => cell.index),
     );
     for (const { polygon } of selectedRegions) {
-      appendClosedPolyline(output, regionLayer, polygon, map);
+      if (geometry.fabrication.pattern) appendSolidHatch(output, regionLayer, polygon, map);
+      else appendClosedPolyline(output, regionLayer, polygon[0], map);
+    }
+    for (const { polygon } of selectedScreenRegions(config, geometry, plate, "pt")) {
+      appendSolidHatch(output, plate === "glass-6066" ? "SCREEN_6066_PT_REGIONS" : "SCREEN_6060_PT_REGIONS", polygon, map);
     }
     for (const placement of pointCodeArtwork.placements) {
       if (
@@ -755,14 +776,15 @@ export async function downloadScreenTiff(asset: SvgAsset): Promise<void> {
 
 function readme(config: DesignConfig): string {
   return [
-    "W 型串聯 DSSC 製造輸出 v9.1 — uniform coating clearance / no centroid trimming",
+    "W 型串聯 DSSC 製造輸出 v9.4 — 18NR-T / PT-1 masks; uniform coating clearance / no centroid trimming",
     "",
     "所有製造尺寸與座標均以毫米（mm）表示。",
-    "TiO2 網版的黑色為 active region，已扣除 Binding、估計膠體擴散、對位與 FTO 切寬；白色不印刷。",
-    "Area Balance只約束移動Voronoi sites以改善分區面積，不再按比例裁小塗層。每個cell以相同法向安全距離內縮，填滿固定分區可用凸形範圍；局部搜尋不保證精確等面積或全域最佳。",
+    "四份漿料網版：18NR-T TiO2 與 PT-1 鉑漿料，各有大片／小片的獨立印刷版。黑色為該漿料實際印刷區，已扣除 Binding、估計膠體擴散、對位與 FTO 切寬；白色不印刷。",
+    "材料分配：Cell 1 為大片18NR-T／小片PT-1；Cell 2相反，依W串聯順序持續交換。PT-1不是18NR-T全頁正負片反相，留白、膠與接觸區不補印另一種漿料。材料代號為使用者指定識別，不改寫電性或厚度假設。",
+    config.artwork ? "圖案模式：Area Balance以36×36密度取樣引導電氣分區，最後以fabrication.activeShapes的實際多區域／孔洞面積計算電流與CV。補膠／流道／安全退讓後的面積才是有效面積；不靠任意比例縮小每個字達成相等。" : "Area Balance只約束移動Voronoi sites以改善分區面積，不再按比例裁小塗層。每個cell以相同法向安全距離內縮，填滿固定分區可用凸形範圍；局部搜尋不保證精確等面積或全域最佳。",
     "Coating Safety Gap是壓合設計情境中的最小淨距離目標，另加對位餘量與情境膠體成長量得到印刷膠邊退讓；較大蝕刻寬度可能主導。預設0.10mm是未驗證設計起點，非材料安全規格。",
     "Point Code Text 已從 v5 介面移除，v5 新設計文字為空。",
-    `bitmap-production/ 內的兩片網版為未壓縮、真正 1-bit、${DEFAULT_BITMAP_DPI} DPI TIFF（uncompressed true 1-bit ${DEFAULT_BITMAP_DPI} DPI TIFF）；檔名以 -1bit-${DEFAULT_BITMAP_DPI}dpi.tif 結尾。`,
+    `bitmap-production/ 內的四份18NR-T／PT-1網版為未壓縮、真正 1-bit、${DEFAULT_BITMAP_DPI} DPI TIFF（uncompressed true 1-bit ${DEFAULT_BITMAP_DPI} DPI TIFF）；檔名以 -1bit-${DEFAULT_BITMAP_DPI}dpi.tif 結尾。`,
     `6060 玻璃製造檔水平鏡射：${config.mirrorGlass6060 ? "是" : "否"}。復原該製造鏡射並加回玻璃局部座標位移後，兩片網版會在組裝座標重合。`,
     "6066 左右 zebra 外露接觸條涵蓋玻璃完整高度；端點 cell gate 使用端點子電池在 facing side 擁有的完整跨度，不是縮短的 bridge。",
     "Terminal geometry: full-height 6066 zebra strips and full cell gates across each endpoint cell's owned facing-side span.",
@@ -772,7 +794,7 @@ function readme(config: DesignConfig): string {
     "每片的 geometry.etchPaths 是唯一 canonical FTO 路徑來源；SVG、DXF 與 Galvo 必須保持相同順序、端點及 source metadata。",
     `binding-mask 使用已扣除垂直注液／排氣槽的實體多邊形；名義 bindingWidthMm = ${String(config.bindingWidthMm)} mm。`,
     "DXF BINDING 是帶孔 SOLID HATCH，與 binding-mask.svg 的實體封膠相同。",
-    "注液網路從上到下覆蓋所有子電池，刪除任何一個槽都會失去完整上下通路；不是流體止回閥，不能消除長期離子遷移。",
+    config.artwork ? "原始跨cell注液槽保留。補膠內部按壓合／淨寬侵蝕後的腔室核心，以近距離生成樹連接；新增槽不跨越第三cell。以最終膠體差集與淨寬侵蝕檢查每個塗層分量到上方入口／下方出口的連通。這是幾何檢查，不是流體／氣泡模擬，也不能消除長期離子遷移。" : "注液網路從上到下覆蓋所有子電池，刪除任何一個槽都會失去完整上下通路；不是流體止回閥，不能消除長期離子遷移。",
     "封膠模型：p=25.4/mesh；a=p-wire；f=(a/p)^2；td=transfer*(2*wire*f+EOM)；h=beadD50。",
     "開口模型：在實際膠版求 Area(offset(print,s))*h=Area(print)*td；再加使用者側向溢膠及製版邊緣誤差餘量。通道剩餘淨寬由膠體膨脹後的幾何實測，不是直接指定。",
     "EOM=Emulsion Over Mesh，來自網版製程，不是 AB-313 TDS。預設10µm和轉移率0.32皆為未量測假設。TDS 200µm 是膠層測試厚度，不是 EOM。非零 measuredWetFilmUm 覆寫網版體積估算。",
@@ -785,6 +807,7 @@ function readme(config: DesignConfig): string {
     `design.json 保留實際 electrodeJitter = ${String(config.electrodeJitter)}（允許上限 2）與 ftoEtchWidthMm = ${String(config.ftoEtchWidthMm)} mm（預設 0.08 mm）。`,
     "",
     "design.json：v9 設計參數，以glassHeightMm作兩片共同高度，僅寬度不同；舊高度欄位匯入時遷移，不再匯出。geometry保留端子、canonical etchPaths與fabrication activeRegions／sealPrint／sealAssembled／ports／retainedFto／openingScenario。activePerimeter不可用作蝕刻操作。",
+    ...(config.artwork ? ["圖案來源保存在config.artwork，含原始輪廓／孔洞、毫米尺寸、配方與電性目標。fabrication.activeRegions僅保留凸形規劃包絡；圖案製造、3D、電流、Pt與TiO2網版必須使用activeShapes。pattern記錄縮放、圖案保留率、補膠、通道及逐cell流道檢查。", "黑白是原始A/B形狀集合，不是某片玻璃固定的TiO2／Pt。W序列決定雙片材料，圖案沿同一組裝座標分配；6060的製造鏡射只套用一次。"] : []),
     "zebraContactReference／process-estimates.zebraContacts：大片左右外露區與保留FTO的實際交集、可接觸面積與導通狀態。Assembly斜線及±標號屬GUIDES_NON_PRINTING參考，不是塗層／膠／蝕刻圖樣。",
     "process-estimates.json：製程中間值、逐 cell 面積、電流基準、雙片 FTO 等效串聯電阻、未擬合 I–V／MPP 情境及來源。",
     "electrical.iscMa 是面積縮放的最弱 cell 基準，不是成品輸出。reference-cell 模式以整片對照 Isc／有效面積／照度換算；面積未知時為 null，絕不回退舊 Jsc。",
@@ -801,10 +824,11 @@ function readme(config: DesignConfig): string {
     "electrical.cellIscMa 是逐 cell 的面積電流基準；limitingCellNumber 為最小有效面積 cell（從 1 起算）。含 FTO 的 Isc 在 scenario.iscMa，切勿把兩者當同一量測。",
     "laser-fill/：toolpaths.json 及兩片 beam-centre fill SVG；laser ON 僅在每段內，段間移動 OFF。需設備校正 power/speed/kerf。",
     "雷射圓形光斑角點可殘留約半徑尺度，交會區重複曝光需校正；檔案不是機台控制協定。",
-    "svg-layered/：七個完整分層 SVG，包含參考圖與非印刷導引。",
-    "svg-production/：兩片二值網版、兩片已移除 GUIDES_NON_PRINTING 的 FTO 蝕刻中心線與 binding-mask。",
-    "pdf-production/：與五個製造 SVG 實體尺寸一致的向量 PDF。",
-    "bitmap-production/：兩片二值網版的 1-bit 1200 DPI TIFF。",
+    "svg-layered/：十個完整圖層，含四份漿料版、電路、材料分布、組裝與加工參考。materials-reference.svg 是雙片18NR-T／PT-1分布參考，不是製造網版。",
+    "svg-production/：四份二值18NR-T／PT-1網版、兩片已移除 GUIDES_NON_PRINTING 的 FTO 蝕刻中心線與 binding-mask。PT-1的DXF使用保留孔洞的SOLID HATCH。",
+    "pdf-production/：與七個製造SVG實體尺寸一致的向量PDF。",
+    "bitmap-production/：四份18NR-T／PT-1的1-bit1200DPI TIFF。",
+    "pasteAssignment：design.json與process-estimates.json均保留產品代號、逐cell的大片／小片漿料、各片材料面積及製造鏡射設定。網版檔名保留tio2／pt相容識別，SVG metadata另標pasteProductCode。",
     `pdf-preview/assembly-preview.pdf：${config.glass6066WidthMm} x ${config.glassHeightMm} mm 組裝參考，含斑馬條接觸位置標示。`,
     "manufacturing-layout.dxf：兩片 TiO2 region、canonical FTO、circuit reference 與 BINDING 分層資料。",
     "fto-galvo-toolpaths.json：v4 中性交換格式，逐片保存canonical etchPaths與voronoi-bleed metadata。",
@@ -828,6 +852,9 @@ export async function downloadProjectBundle(
   includePdfs: boolean,
   onProgress?: ProgressCallback,
 ): Promise<void> {
+  if (config.artwork && (!geometry.fabrication.pattern || geometry.fabrication.pattern.sourceId !== config.artwork.id || geometry.fabrication.errors.length)) {
+    throw new Error("圖案製版尚未通過幾何／流道／製程檢查，不能匯出製造包。");
+  }
   let fflate: typeof import("fflate");
   try {
     fflate = await import("fflate");
@@ -837,7 +864,7 @@ export async function downloadProjectBundle(
     });
   }
 
-  const exportAssets = assets;
+  const exportAssets = config.artwork ? buildFabricationAssets(config, geometry, pointCodeArtwork) : assets;
   const productionAssets = exportAssets.filter(isProductionAsset);
   const screenAssets = productionAssets.filter(isScreenAsset);
   const assemblyPreviews = exportAssets.filter(isAssemblyPreview).slice(0, 1);
@@ -876,6 +903,7 @@ export async function downloadProjectBundle(
         geometry,
         zebraContactReference: zebraContactRegions(geometry),
         pointCodeArtwork,
+        pasteAssignment: pasteAssignment(config, geometry),
       },
       null,
       2,
@@ -907,6 +935,8 @@ export async function downloadProjectBundle(
     isolationRoutes: geometry.fabrication.isolationRoutes,
     voronoiBleedCheck: geometry.fabrication.bleedCheck,
     ports: geometry.fabrication.ports,
+    pasteAssignment: pasteAssignment(config, geometry),
+    ...(geometry.fabrication.pattern ? { pattern: geometry.fabrication.pattern, activeShapes: geometry.fabrication.activeShapes } : {}),
     provenance: { viscosity: "Everlight Eversolar AB-313 TDS 20180206 V.1, p1: 38000 ± 8000 mPa.s at 25°C", beadD50: "User: median 15 µm, grade 1000 mesh", other: "User-adjustable engineering assumptions; see PROCESS_MODEL.md" },
   }, null, 2)}\n`);
   report("建立 Galvo 蝕刻路徑");

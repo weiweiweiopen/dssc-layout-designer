@@ -209,7 +209,7 @@ function expectGrayscale(svg: string): void {
 }
 
 describe("fabrication assets and preview dimensions", () => {
-  it("returns exactly seven layered assets with exact millimetre roots", () => {
+  it("returns four paste masks and ten layered assets with exact millimetre roots", () => {
     const { assets } = fixture();
     const expected: Array<[string, string, number, number]> = [
       ["screen-glass-6066-tio2", "screen-glass-6066-tio2.svg", 66, 60],
@@ -219,9 +219,12 @@ describe("fabrication assets and preview dimensions", () => {
       ["fto-etch-glass-6066", "fto-etch-glass-6066.svg", 66, 60],
       ["fto-etch-glass-6060", "fto-etch-glass-6060.svg", 60, 60],
       ["binding-mask", "binding-mask.svg", 66, 60],
+      ["screen-glass-6066-pt", "screen-glass-6066-pt.svg", 66, 60],
+      ["screen-glass-6060-pt", "screen-glass-6060-pt.svg", 60, 60],
+      ["materials-reference", "materials-reference.svg", 134, 60],
     ];
 
-    expect(assets).toHaveLength(7);
+    expect(assets).toHaveLength(10);
     expect(
       assets.map(({ id, filename, widthMm, heightMm }) => [
         id,
@@ -243,7 +246,7 @@ describe("fabrication assets and preview dimensions", () => {
     expect(assets.map(({ id }) => id)).not.toContain("font-voronoi-reference");
   });
 
-  it("reports seven view sizes, preserves the circuit gap, and rejects the removed view", () => {
+  it("reports ten view sizes, preserves the dual-plate gap, and rejects the removed view", () => {
     const { config, geometry, pointCodes } = fixture({
       glass6066WidthMm: 70,
       glassHeightMm: 64,
@@ -255,15 +258,17 @@ describe("fabrication assets and preview dimensions", () => {
       widthMm: 136,
       heightMm: 64,
     });
+    expect(previewSize(geometry, "materials")).toEqual(previewSize(geometry, "circuit"));
     for (const mode of [
       "assembly",
       "glass-6066",
+      "pt-6066",
       "etch-6066",
       "binding",
     ] as const) {
       expect(previewSize(geometry, mode)).toEqual({ widthMm: 70, heightMm: 64 });
     }
-    for (const mode of ["glass-6060", "etch-6060"] as const) {
+    for (const mode of ["glass-6060", "pt-6060", "etch-6060"] as const) {
       expect(previewSize(geometry, mode)).toEqual({ widthMm: 58, heightMm: 64 });
     }
     expect(() => previewSize(geometry, "font" as PreviewMode)).toThrow(

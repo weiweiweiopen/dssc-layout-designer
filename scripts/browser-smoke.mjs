@@ -115,9 +115,9 @@ try {
   ensure(await page.evaluate(() => [...document.querySelectorAll('[data-testid="assembly-contacts"] [data-area-mm2]')]
     .every((el) => Math.abs(Number(el.dataset.areaMm2) - 384) < 1e-6)), "Contact readout does not follow resized exposed FTO");
   await page.screenshot({ path: join(directory, "assembly-zebra-resized.png") });
-  await button("Screen Smaller");
+  await page.click('[data-view-mode="glass-6060"]');
   await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="glass-6060"]')?.getAttribute("viewBox") === "0 0 58 64");
-  await button("Screen Bigger");
+  await page.click('[data-view-mode="glass-6066"]');
   await page.waitForFunction(() => document.querySelector('.preview-frame svg[data-view="glass-6066"]')?.getAttribute("viewBox") === "0 0 70 64");
   await button("Final Assembly");
   await field("Smaller Electrode W", 70);
@@ -337,7 +337,7 @@ try {
   const vector = await download("Export Vector ZIP");
   ensure(strFromU8(referenceVector["svg-production/binding-mask.svg"]) === strFromU8(vector["svg-production/binding-mask.svg"]),
     "Electrical reference / voltage observation changed the production seal geometry");
-  ensure(Object.keys(vector).length === 20, "Vector bundle count differs from 20");
+  ensure(Object.keys(vector).length === 25, "Vector bundle count differs from 25");
   const project = JSON.parse(strFromU8(vector["design.json"]));
   const f = project.geometry.fabrication;
   ensure(f.coatingClearance.method === "parallel-wall-offset-no-trimming" &&
@@ -365,6 +365,8 @@ try {
       !/data-source="active-perimeter"|data-source="terminal-isolation"|data-source="contact-strip-isolation"/.test(etch), "Etch has no bleed or still contains a frame");
     const screen = strFromU8(vector[`svg-production/screen-glass-${suffix}-tio2.svg`]);
     ensure(!/<circle/.test(screen), "Removed point code produced screen holes");
+    ensure(screen.includes('data-paste="18NR-T"'), "TiO2 paste identity missing");
+    ensure(strFromU8(vector[`svg-production/screen-glass-${suffix}-pt.svg`]).includes('data-paste="PT-1"'), "Original Layout is missing its PT-1 mask");
     ensure(vector[`laser-fill/glass-${suffix}-fill.svg`], "Missing laser fill SVG");
   }
   const laser = JSON.parse(strFromU8(vector["laser-fill/toolpaths.json"]));
@@ -511,7 +513,7 @@ try {
   // Export while the scenario is displayed; production must still be printed geometry.
   await toggleSeal("ASSEMBLY_SEAL", "compression-scenario");
   const complete = await download("Complete ZIP: PDF + 1-bit TIFF");
-  ensure(Object.keys(complete).length === 28, "Complete bundle count differs from 28");
+  ensure(Object.keys(complete).length === 37, "Complete bundle count differs from 37");
   ensure(strFromU8(complete["svg-production/binding-mask.svg"]) === strFromU8(vector["svg-production/binding-mask.svg"]),
     "Scenario preview changed the production adhesive mask");
   ensure(strFromU8(complete["svg-layered/assembly-preview.svg"]) === strFromU8(vector["svg-layered/assembly-preview.svg"]),
@@ -542,7 +544,7 @@ try {
     estimates.electrical.scenario.confidence === "unfitted-scenario" &&
     Math.abs((await electricalReadout()).ftoIscMa - estimates.electrical.scenario.iscMa) < 1e-9,
     "Exported FTO / I–V scenario is missing or differs from the UI");
-  console.log(JSON.stringify({ status: "PASS", vectorFiles: 20, completeFiles: 28, fillPorts: f.ports.length,
+  console.log(JSON.stringify({ status: "PASS", vectorFiles: 25, completeFiles: 37, fillPorts: f.ports.length,
     activeAreaMm2: f.totalActiveMm2, cellMinMm2: Math.min(...f.cellAreasMm2), cellMaxMm2: Math.max(...f.cellAreasMm2),
     areaCv: f.areaCv, printWidthMm: project.config.bindingWidthMm, actualStencil: estimates.actualStencil,
     screenshotAperture, apertureDesign: estimates.apertureDesign, electrical: estimates.electrical,

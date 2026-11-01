@@ -12,6 +12,8 @@ import {
   type PolygonSet,
 } from "./model";
 import { zebraContactRegions } from "./contacts";
+import { cellCoating } from "./artwork-source";
+import { materialForPlate, PASTES } from "./materials";
 
 export interface SvgAsset {
   id: string;
@@ -182,6 +184,7 @@ export function previewSize(
 ): PreviewSize {
   switch (mode) {
     case "circuit":
+    case "materials":
       return {
         widthMm:
           geometry.glass6066.width +
@@ -193,6 +196,7 @@ export function previewSize(
         ),
       };
     case "glass-6060":
+    case "pt-6060":
     case "etch-6060":
       return {
         widthMm: geometry.glass6060.width,
@@ -200,6 +204,7 @@ export function previewSize(
       };
     case "assembly":
     case "glass-6066":
+    case "pt-6066":
     case "etch-6066":
     case "binding":
       return {
@@ -230,23 +235,15 @@ function documentSvg(options: DocumentOptions): string {
   ].join("\n");
 }
 
-function selectedScreenCells(
-  geometry: LayoutGeometry,
-  plate: PlateId,
-): LayoutGeometry["cells"] {
-  return geometry.cells.filter((cell) => materialForPlate(cell, plate) === "tio2");
-}
-
 function selectedScreenRegions(
   config: DesignConfig,
   geometry: LayoutGeometry,
   plate: PlateId,
-): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[] }> {
+  material: Material = "tio2",
+): Array<{ cell: LayoutGeometry["cells"][number]; polygon: Point[][]; piece: number }> {
   void config;
-  return selectedScreenCells(geometry, plate).flatMap((cell) => {
-    const polygon = geometry.fabrication.activeRegions[cell.index];
-    return polygon.length >= 3 ? [{ cell, polygon }] : [];
-  });
+  return geometry.cells.filter((cell) => materialForPlate(cell, plate) === material)
+    .flatMap((cell) => cellCoating(geometry.fabrication, cell.index).map((polygon, piece) => ({ cell, polygon, piece })));
 }
 
 function renderScreenRegions(
@@ -254,14 +251,15 @@ function renderScreenRegions(
   geometry: LayoutGeometry,
   plate: PlateId,
   map: CoordinateMap,
+  material: Material = "tio2",
 ): string {
   const suffix = plate === "glass-6066" ? "6066" : "6060";
-  return selectedScreenRegions(config, geometry, plate)
-    .flatMap(({ cell, polygon }) => {
-      const path = ringPath(polygon, map);
+  return selectedScreenRegions(config, geometry, plate, material)
+    .flatMap(({ cell, polygon, piece }) => {
+      const path = polygon.map((ring) => ringPath(ring, map)).join(" ");
       if (!path) return [];
       return [
-        `<path data-region-id="screen-${suffix}-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="tio2" d="${path}"/>`,
+        `<path data-region-id="screen-${suffix}-cell-${cell.index}${geometry.fabrication.pattern ? `-${material}-piece-${piece}` : ""}" data-subcell-index="${cell.index}" data-material="${material}" data-paste="${PASTES[material].productCode}"${geometry.fabrication.pattern ? ' fill-rule="evenodd"' : ""} d="${path}"/>`,
       ];
     })
     .join("\n");
@@ -299,6 +297,7 @@ function buildScreenSvg(
   geometry: LayoutGeometry,
   pointCodeArtwork: PointCodeArtwork,
   plate: PlateId,
+  material: Material = "tio2",
 ): string {
   const rect = plateRect(geometry, plate);
   const map = plateMap(config, geometry, plate);
@@ -307,16 +306,16 @@ function buildScreenSvg(
   const suffix = is6066 ? "6066" : "6060";
   const body = [
     `<rect id="SCREEN_PAGE_WHITE" x="0" y="0" width="${number(rect.width)}" height="${number(rect.height)}" fill="${WHITE}" shape-rendering="crispEdges"/>`,
-    `<g id="SCREEN_${suffix}_TIO2_REGIONS" data-operation="screen-print" data-material="tio2" fill="${BLACK}" shape-rendering="crispEdges">`,
-    renderScreenRegions(config, geometry, plate, map),
+    `<g id="SCREEN_${suffix}_${material.toUpperCase()}_REGIONS" data-operation="screen-print" data-material="${material}" data-paste="${PASTES[material].productCode}" fill="${BLACK}" shape-rendering="crispEdges">`,
+    renderScreenRegions(config, geometry, plate, map, material),
     "</g>",
     `<g id="SCREEN_POINT_CODE_KNOCKOUTS" data-operation="no-print-knockout" fill="${WHITE}">`,
-    renderPointCodeKnockouts(config, geometry, pointCodeArtwork, plate, map),
+    material === "tio2" ? renderPointCodeKnockouts(config, geometry, pointCodeArtwork, plate, map) : "",
     "</g>",
   ].join("\n");
   return documentSvg({
-    title: `Glass ${suffix} TiO2 screen${mirrored ? " (fabrication mirror)" : ""}`,
-    view: plate,
+    title: `${is6066 ? "Bigger" : "Smaller"} electrode ${PASTES[material].productCode} (${PASTES[material].material}) screen${mirrored ? " (fabrication mirror)" : ""}`,
+    view: material === "tio2" ? plate : is6066 ? "pt-6066" : "pt-6060",
     plate,
     widthMm: rect.width,
     heightMm: rect.height,
@@ -326,8 +325,11 @@ function buildScreenSvg(
     metadata: {
       coordinateSystem: "conductive-side plate-local",
       binaryArtwork: true,
-      operation: "tio2-regions-with-point-code-knockouts",
+      pasteProductCode: PASTES[material].productCode,
+      material,
+      operation: material === "pt" ? "patterned-pt-regions" : "tio2-regions-with-point-code-knockouts",
       pointCodeRadiusMm: POINT_CODE_RADIUS_MM,
+      ...(config.artwork ? { artworkSourceId: config.artwork.id, patternedMaterial: material, activeShapeBasis: "fabrication.activeShapes" } : {}),
     },
   });
 }
@@ -360,7 +362,7 @@ function buildAssemblyPreview(geometry: LayoutGeometry, envelope = false): strin
     .map((cell) => {
       const material = cell.glass6066Material;
       const fill = material === "tio2" ? ASSEMBLY_TIO2 : ASSEMBLY_PT;
-      return `<path data-region-id="assembly-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" d="${ringPath(geometry.fabrication.activeRegions[cell.index], map)}" fill="${fill}"/>`;
+      return `<path data-region-id="assembly-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" d="${cellCoating(geometry.fabrication, cell.index).map((p) => p.map((r) => ringPath(r, map)).join(" ")).join(" ")}" fill-rule="evenodd" fill="${fill}"/>`;
     })
     .join("\n");
   const body = [
@@ -385,15 +387,6 @@ function buildAssemblyPreview(geometry: LayoutGeometry, envelope = false): strin
       zebraContacts: "hatched exposed retained FTO on bigger electrode; non-printing reference, not adhesive / etch artwork",
     },
   });
-}
-
-function materialForPlate(
-  cell: LayoutGeometry["cells"][number],
-  plate: PlateId,
-): Material {
-  return plate === "glass-6066"
-    ? cell.glass6066Material
-    : cell.glass6060Material;
 }
 
 function circuitPatternId(plate: PlateId): string {
@@ -433,6 +426,7 @@ function renderCircuitPanel(
   config: DesignConfig,
   geometry: LayoutGeometry,
   plate: PlateId,
+  materialsOnly = false,
 ): string {
   const rect = plateRect(geometry, plate);
   const origin = circuitPanelOrigin(geometry, plate);
@@ -443,7 +437,7 @@ function renderCircuitPanel(
       const material = materialForPlate(cell, plate);
       const fill =
         material === "tio2" ? "#d5d5d5" : `url(#${circuitPatternId(plate)})`;
-      return `<path data-region-id="circuit-${suffix}-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" data-electron-order="${cell.index + 1}" d="${ringPath(geometry.fabrication.activeRegions[cell.index], map)}" fill="${fill}"/>`;
+      return `<path data-region-id="${materialsOnly ? "materials" : "circuit"}-${suffix}-cell-${cell.index}" data-subcell-index="${cell.index}" data-material="${material}" data-paste="${PASTES[material].productCode}" data-electron-order="${cell.index + 1}" d="${cellCoating(geometry.fabrication, cell.index).map((p) => p.map((r) => ringPath(r, map)).join(" ")).join(" ")}" fill-rule="evenodd" fill="${fill}"/>`;
     })
     .join("\n");
   const routePoints =
@@ -453,7 +447,8 @@ function renderCircuitPanel(
   const labels = geometry.cells
     .map((cell) => {
       const site = map(cell.site);
-      return `<text data-region-id="circuit-${suffix}-order-${cell.index + 1}" data-subcell-index="${cell.index}" data-electron-order="${cell.index + 1}" x="${number(site.x)}" y="${number(site.y)}" fill="${BLACK}" stroke="none" font-size="1.6" text-anchor="middle" dominant-baseline="middle">${cell.index + 1}</text>`;
+      const code = PASTES[materialForPlate(cell, plate)].productCode;
+      return `<text data-region-id="${materialsOnly ? "materials" : "circuit"}-${suffix}-order-${cell.index + 1}" data-subcell-index="${cell.index}" data-electron-order="${cell.index + 1}" data-paste="${code}" x="${number(site.x)}" y="${number(site.y)}" fill="${BLACK}" stroke="${materialsOnly ? WHITE : "none"}"${materialsOnly ? ' stroke-width="0.22" paint-order="stroke"' : ""} font-size="${materialsOnly ? "1.15" : "1.6"}" text-anchor="middle" dominant-baseline="middle">${cell.index + 1}${materialsOnly ? ` · ${code}` : ""}</text>`;
     })
     .join("\n");
   return [
@@ -463,9 +458,9 @@ function renderCircuitPanel(
       ? `<g id="CIRCUIT_6066_CONTACT_STRIPS">${renderCircuitContacts(geometry, map)}</g>`
       : "",
     `<g id="CIRCUIT_${suffix}_MATERIAL_CELLS">${cells}</g>`,
-    `<g id="ELECTRON_ROUTE_${suffix}" data-ordered="true" fill="none" stroke="${BLACK}" stroke-width="0.1" stroke-linecap="round" stroke-linejoin="round"><path data-route-point-count="${routePoints.length}" d="${linePath(routePoints, map)}"/></g>`,
+    materialsOnly ? "" : `<g id="ELECTRON_ROUTE_${suffix}" data-ordered="true" fill="none" stroke="${BLACK}" stroke-width="0.1" stroke-linecap="round" stroke-linejoin="round"><path data-route-point-count="${routePoints.length}" d="${linePath(routePoints, map)}"/></g>`,
     `<g id="CIRCUIT_${suffix}_ORDER_LABELS">${labels}</g>`,
-    `<text x="${number(origin.x + rect.width / 2)}" y="${number(origin.y + 1.6)}" fill="${BLACK}" stroke="none" font-size="1.4" text-anchor="middle">GLASS ${suffix}</text>`,
+    `<text x="${number(origin.x + rect.width / 2)}" y="${number(origin.y + 1.6)}" fill="${BLACK}" stroke="none" font-size="1.4" text-anchor="middle">${materialsOnly ? `${plate === "glass-6066" ? "BIGGER" : "SMALLER"} · ${number(rect.width)} × ${number(rect.height)} mm${plate === "glass-6060" && config.mirrorGlass6060 ? " · MIRRORED" : ""}` : `GLASS ${suffix}`}</text>`,
     "</g>",
   ]
     .filter(Boolean)
@@ -475,17 +470,18 @@ function renderCircuitPanel(
 function buildCircuitReference(
   config: DesignConfig,
   geometry: LayoutGeometry,
+  materialsOnly = false,
 ): string {
   const size = previewSize(geometry, "circuit");
   const body = [
     `<rect id="CIRCUIT_PAGE" x="0" y="0" width="${number(size.widthMm)}" height="${number(size.heightMm)}" fill="${WHITE}"/>`,
     circuitPatternDefinitions(),
-    renderCircuitPanel(config, geometry, "glass-6066"),
-    renderCircuitPanel(config, geometry, "glass-6060"),
+    renderCircuitPanel(config, geometry, "glass-6066", materialsOnly),
+    renderCircuitPanel(config, geometry, "glass-6060", materialsOnly),
   ].join("\n");
   return documentSvg({
-    title: "Dual-plate circuit reference",
-    view: "circuit",
+    title: materialsOnly ? "Dual-plate paste distribution — 18NR-T / PT-1" : "Dual-plate circuit reference",
+    view: materialsOnly ? "materials" : "circuit",
     plate: "circuit",
     widthMm: size.widthMm,
     heightMm: size.heightMm,
@@ -495,7 +491,8 @@ function buildCircuitReference(
     metadata: {
       panelGapMm: CIRCUIT_PANEL_GAP_MM,
       glass6060Mirrored: config.mirrorGlass6060,
-      routeStrokeMm: 0.1,
+      routeStrokeMm: materialsOnly ? 0 : 0.1,
+      materialProducts: "18NR-T / PT-1",
     },
   });
 }
@@ -661,10 +658,16 @@ export function buildPreviewSvg(
       return buildAssemblyPreview(geometry, compressionEnvelope);
     case "circuit":
       return buildCircuitReference(config, geometry);
+    case "materials":
+      return buildCircuitReference(config, geometry, true);
     case "glass-6066":
       return buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6066");
     case "glass-6060":
       return buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6060");
+    case "pt-6066":
+      return buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6066", "pt");
+    case "pt-6060":
+      return buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6060", "pt");
     case "etch-6066":
       return buildEtchSvg(config, geometry, "glass-6066");
     case "etch-6060":
@@ -693,11 +696,11 @@ export function buildFabricationAssets(
   pointCodeArtwork: PointCodeArtwork,
 ): SvgAsset[] {
   const circuitSize = previewSize(geometry, "circuit");
-  return [
+  const assets = [
     asset(
       "screen-glass-6066-tio2",
       "screen-glass-6066-tio2.svg",
-      "Glass 6066 TiO2 screen",
+      "Bigger electrode 18NR-T (TiO2) screen",
       geometry.glass6066.width,
       geometry.glass6066.height,
       buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6066"),
@@ -705,7 +708,7 @@ export function buildFabricationAssets(
     asset(
       "screen-glass-6060-tio2",
       "screen-glass-6060-tio2.svg",
-      "Glass 6060 TiO2 screen",
+      "Smaller electrode 18NR-T (TiO2) screen",
       geometry.glass6060.width,
       geometry.glass6060.height,
       buildScreenSvg(config, geometry, pointCodeArtwork, "glass-6060"),
@@ -751,4 +754,12 @@ export function buildFabricationAssets(
       buildBindingSvg(config, geometry),
     ),
   ];
+  for (const plate of ["glass-6066", "glass-6060"] as const) {
+    const glass = plateRect(geometry, plate);
+    assets.push(asset(`screen-${plate}-pt`, `screen-${plate}-pt.svg`, `${plate} PT-1 (Pt) screen`, glass.width, glass.height,
+      buildScreenSvg(config, geometry, pointCodeArtwork, plate, "pt")));
+  }
+  assets.push(asset("materials-reference", "materials-reference.svg", "18NR-T / PT-1 dual-plate paste distribution", circuitSize.widthMm, circuitSize.heightMm,
+    buildCircuitReference(config, geometry, true)));
+  return assets;
 }

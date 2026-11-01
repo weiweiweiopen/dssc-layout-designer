@@ -23,6 +23,11 @@ npm run preview -- --host 127.0.0.1
 
 ## Browser and export checks
 
+The independent, local **Type × Geometry Studio** is at `?studio=type`.
+See [TYPE_STUDIO.md](TYPE_STUDIO.md) for its two flavors, outlined geometry
+exports, direct manipulation and the boundary before DSSC fabrication conversion.
+Run `npm run test:browser:studio` for its isolated browser checks.
+
 With Chrome installed, set `APP_URL` to the address of the running app. The development server normally uses port 5173; production preview normally uses 4173.
 
 ```sh
@@ -37,11 +42,31 @@ APP_URL=https://weiweiweiopen.github.io/dssc-layout-designer/ npm run test:brows
 
 Set `CHROME_PATH` for a nonstandard Chrome installation and `TEST_TMPDIR` to choose the temporary download directory. The script uses an isolated browser profile and checks language switching, parameter persistence, geometry, production ZIPs, PDF and 1-bit TIFF downloads.
 
+`npm run test:browser:materials` verifies both the original Layout and a Studio
+trial: dual-plate 18NR-T / PT-1 references, per-cell assignments, all four direct
+TIFF downloads and their actual black-pixel areas. Both modes generate 25-file
+vector packages and 37-file complete packages. `src/materials.ts` centralizes
+paste identities and assignment reports; product labels do not calibrate
+electrical or thickness properties.
+
 ## 3D review checks
 
 `npm run test:browser:3d` exercises the lazy-loaded WebGL viewer in Chrome, including camera gestures, projections, layer visibility, independent dyes, persistence and unchanged vector exports. Set `APP_URL`, `CHROME_PATH` and `TEST_TMPDIR` as for the other browser check.
 
 `src/review-model.ts` maps canonical fabrication polygons and keeps visual settings in separate local storage; `src/review-shapes.ts` preserves interior holes during triangulation. `Review3D.tsx` is loaded only when its tab is selected. No external model, environment map or font service is required.
+
+Glass and retained FTO use unfilled boundary lines in 3D so uncoated / unsealed
+spaces are visually clear. `npm run test:browser:3d:transparency` compares actual
+WebGL screenshots with substrates on/off to catch gray-pane regressions, checks
+that coating and adhesive surfaces remain visible, and verifies unchanged
+engineering settings. It accepts `APP_URL`, `CHROME_PATH` and `TEST_TMPDIR`.
+
+`npm run test:browser:3d:pattern` reproduces the patterned serif headline, samples
+gray gaps with read-only ray diagnostics, and checks the same pixels have alpha
+zero on a transparent canvas at ×1/×40/high-scale, top and oblique views. It also
+checks cap triangles stay inside canonical footprints and appearance does not
+change the trial configuration. The default checkerboard is CSS behind the
+alpha canvas; CAD-grid/white modes are viewing backgrounds, not material layers.
 
 After adding dependencies, run `npm run notices:dependencies` to append their installed license files before building the distributed notice.
 

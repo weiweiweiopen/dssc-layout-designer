@@ -1,5 +1,6 @@
 import type { DesignConfig, FtoPreset, LayoutGeometry, PlateId } from "./model";
 import { DSSC_REFERENCE, voltageObservation } from "./reference-data";
+import { cellCoating } from "./artwork-source";
 
 export const TEC_SOURCE = "https://assetmanager-ws.pilkington.com/fileserver.aspx?cmd=get_file&ref=GL058&cd=cd";
 export const SERIES_RESISTANCE_SOURCE = "https://www.pveducation.org/pvcdrom/solar-cell-operation/series-resistance";
@@ -24,7 +25,7 @@ export function ftoResistance(c: DesignConfig, g: LayoutGeometry) {
     const edge = g.boundaries.find((b) => b.seriesConnection && b.connectionPlate === plate && b.cells.includes(cell.index));
     const terminal = g.terminals.find((t) => t.plate === plate && t.cellIndex === cell.index);
     const collector = edge ?? terminal?.gate;
-    const region = g.fabrication.activeRegions[cell.index];
+    const region = cellCoating(g.fabrication, cell.index).flat(2);
     const sheetOhmSq = plate === "glass-6066" ? c.ftoBiggerOhmSq : c.ftoSmallerOhmSq;
     if (!collector || !region.length) return { cellNumber: cell.index + 1, plate, sheetOhmSq, widthMm: 0, leadMm: 0, squares: null, ohm: null };
     const dx = collector.end.x - collector.start.x, dy = collector.end.y - collector.start.y;
@@ -45,7 +46,7 @@ export function ftoResistance(c: DesignConfig, g: LayoutGeometry) {
     paths,
     model: "equivalent-uniform-strip-collection" as const,
     confidence: "heuristic" as const,
-    basis: "Per cell and plate: R = Rsheet * (A / (3 W²) + lead / W); W is the series-edge / terminal-gate length minus etch width. Uniform generation, full-edge ideal collector. No 2-D constriction, busbar/contact, electrolyte, Pt or interfacial resistance. Both plates summed; not a measured module Rs.",
+    basis: "Per cell and plate: R = Rsheet * (A / (3 W²) + lead / W); W is the series-edge / terminal-gate length minus etch width. Uniform generation, full-edge ideal collector. No 2-D constriction, busbar/contact, electrolyte, Pt or interfacial resistance. Both plates summed; not a measured module Rs." + (g.fabrication.pattern ? " Patterned/disconnected coating footprints use their actual net area; this equivalent-strip estimate does not resolve local current crowding or certify patterned-cell efficiency." : ""),
     source: "https://www.pveducation.org/pvcdrom/design-of-silicon-cells/emitter-resistance",
   };
 }

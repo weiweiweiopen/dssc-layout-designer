@@ -1,14 +1,16 @@
 # DSSC Layout Designer
 
-**W-type series-module geometry and experimental mask generation · v9.3**
+**W-type series-module geometry and experimental mask generation · v9.4**
 
 **[Open the interactive designer →](https://weiweiweiopen.github.io/dssc-layout-designer/)**
+
+[Type × Geometry Studio →](https://weiweiweiopen.github.io/dssc-layout-designer/?studio=type) creates editable headline / capsule / pixel artwork and transfers resolved contours into a separate W-series trial. [Studio workflow and validation boundaries](TYPE_STUDIO.md).
 
 Use a desktop browser; Chrome is the tested reference. Select **EN** at the top right for English. No installation or account is required.
 
 ## Purpose
 
-This research tool explores how subcell geometry, FTO isolation and sealing clearances affect active-area utilisation and current matching. It generates coordinated TiO₂ print masks, FTO removal paths and adhesive stencils from one module layout, supporting comparisons before experimental fabrication.
+This research tool explores how subcell geometry, FTO isolation and sealing clearances affect active-area utilisation and current matching. It generates coordinated **18NR-T TiO₂ and PT-1 platinum print masks**, FTO removal paths and adhesive stencils from one module layout, supporting comparisons before experimental fabrication.
 
 The reference construction uses two glass/FTO electrodes, alternating TiO₂/Pt regions and an AB-313 seal. Printing, registration and electrical inputs should be set from measurements for the process being evaluated.
 
@@ -26,24 +28,26 @@ The **left panel contains the settings**; the **right panel shows the selected d
    |---|---|
    | **Final Assembly** | Coatings, seal and hatched **± ZEBRA** contact areas, with their dimensions below the drawing. |
    | **Circuit** | Subcell sequence, electron route and terminal connectivity. |
-   | **Screen Bigger / Smaller** | TiO₂ print regions on each electrode; black denotes printing. |
+   | **Paste distribution** | Both plates with each cell labelled 18NR-T or PT-1. Cell 1 is bigger TiO₂ / smaller Pt; cell 2 reverses. |
+   | **Bigger / Smaller 18NR-T** | TiO₂ paste masks; black denotes 18NR-T printing. |
+   | **Bigger / Smaller PT-1** | Independent platinum paste masks; black denotes PT-1 printing, not a full-page inversion of TiO₂. |
    | **Etch Bigger / Smaller** | FTO removal paths and isolation at the glass edges. |
    | **Binding** | Adhesive stencil; black denotes adhesive and white slots provide fill/vent access. |
    | **3D Review** | Registered two-electrode stack, independently colored TiO₂ regions, visible-layer controls and exploded views. |
 
-   In **3D Review**, middle-drag or left-drag to orbit, **Shift + middle-drag** or right-drag to pan, and use the wheel to zoom. Select a dye appearance for each electrode in the right-hand controls. **Explode / interface** separates layers; **Thin-layer scale = 1** removes thickness exaggeration. Colors, opacity and unmeasured thicknesses are illustrative; appearance settings are saved locally, separately from manufacturing parameters.
+   In **3D Review**, middle-drag or left-drag to orbit, **Shift + middle-drag** or right-drag to pan, and use the wheel to zoom. Select a dye appearance for each electrode. The default **Transparent checkerboard** reveals uncoated / unsealed clearances; dark CAD grid and white backgrounds are optional. **Explode / interface** separates layers; **Thin-layer scale = 1** removes thickness exaggeration. Appearance settings are illustrative and stored separately from manufacturing parameters.
 
-4. **Download the mask set.** When **DRC pass** appears at the top right, scroll down the left panel to **TiO2 Screens** and select **Complete ZIP: PDF + 1-bit TIFF**. Unzip the download to inspect the files below. If export remains greyed out, read **DRC / Design Check**. **Save View SVG** saves the displayed reference drawing; the ZIP provides the fabrication layers.
+4. **Download the mask set.** When **DRC pass** appears at the top right, scroll down the left panel to **18NR-T / PT-1 Screens** and select **Complete ZIP: PDF + 1-bit TIFF**. Individual TIFF downloads are available for all four masks. If export remains greyed out, read **DRC / Design Check**. **Save View SVG** saves the displayed reference drawing; the ZIP provides the fabrication layers.
 
 ## Files for review and fabrication
 
 | Files in the ZIP | Intended use |
 |---|---|
-| `svg-production/`, `pdf-production/` | Separate TiO₂, FTO-removal and adhesive artwork for process review and fabrication preparation. |
-| `bitmap-production/` | Physical-size TiO₂ masks: 1200 DPI, true 1-bit TIFF. |
+| `svg-production/`, `pdf-production/` | Four separate 18NR-T / PT-1 masks, FTO-removal and adhesive artwork. |
+| `bitmap-production/` | All four physical-size paste masks: 1200 DPI, true 1-bit TIFF. |
 | `manufacturing-layout.dxf`, `laser-fill/` | CAD geometry and laser-fill paths for adaptation to the available equipment. |
 | `svg-layered/`, `pdf-preview/` | Layer and assembly references, including contact annotations. |
-| `design.json`, `process-estimates.json` | Parameter record, geometry, cell areas and calculation assumptions for comparing trials. |
+| `design.json`, `process-estimates.json` | Parameters, geometry, cell areas, `pasteAssignment` and calculation assumptions. |
 
 **Export Vector ZIP** provides the vector drawings and data without PDF/TIFF. Keep the complete trial package when comparing variants.
 

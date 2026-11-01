@@ -36,7 +36,7 @@ export function buildPointCodeArtwork(
   config: DesignConfig,
   geometry: LayoutGeometry,
 ): PointCodeArtwork {
-  const normalizedText = normalizeVoronoiLayoutText(config.text);
+  const normalizedText = normalizeVoronoiLayoutText(config.artwork ? "" : config.text);
   const characters = Array.from(normalizedText);
   const electrodes = geometry.cells
     .slice()
@@ -146,6 +146,7 @@ export function validatePointCodeArtwork(
   artwork: PointCodeArtwork,
 ): DesignWarning[] {
   const warnings: DesignWarning[] = [];
+  if (config.artwork) return warnings;
   const addError = (message: string): void => {
     warnings.push({ severity: "error", message });
   };

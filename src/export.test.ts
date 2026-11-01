@@ -376,6 +376,8 @@ describe("buildManufacturingDxf", () => {
       SCREEN_6060_REGIONS_LAYER,
       SCREEN_6066_KNOCKOUTS_LAYER,
       SCREEN_6060_KNOCKOUTS_LAYER,
+      "SCREEN_6060_PT_REGIONS",
+      "SCREEN_6066_PT_REGIONS",
       "FTO_ETCH_6066",
       "FTO_ETCH_6060",
       "CIRCUIT_REFERENCE",
@@ -706,6 +708,7 @@ describe("buildManufacturingDxf", () => {
     const mirroredLayers = new Set([
       SCREEN_6060_REGIONS_LAYER,
       SCREEN_6060_KNOCKOUTS_LAYER,
+      "SCREEN_6060_PT_REGIONS",
       "FTO_ETCH_6060",
     ]);
 
@@ -723,7 +726,7 @@ describe("buildManufacturingDxf", () => {
       expect(mirroredXValues).toHaveLength(xValues.length);
       xValues.forEach((x, pointIndex) => {
         expect(mirroredXValues[pointIndex]).toBeCloseTo(
-          mirroredLayers.has(layer) ? base.geometry.glass6060.width - x : x,
+          mirroredLayers.has(layer) && !(entity.type === "HATCH" && pointIndex === 0) ? base.geometry.glass6060.width - x : x,
           9,
         );
       });
@@ -941,7 +944,7 @@ describe("downloadProjectBundle", () => {
     vi.clearAllMocks();
   });
 
-  it("reports 16 complete-export steps before browser PDF/TIFF conversion", async () => {
+  it("reports 22 complete-export steps for all four paste masks", async () => {
     const { config, geometry, pointCodeArtwork } = fixture();
     const assets = buildFabricationAssets(config, geometry, pointCodeArtwork).map(
       (asset) =>
@@ -962,11 +965,11 @@ describe("downloadProjectBundle", () => {
       ),
     ).rejects.toThrow("page dimensions must be finite positive millimetre values");
 
-    expect(progress[0]).toEqual([0, 16]);
-    expect(progress.at(-1)).toEqual([7, 16]);
+    expect(progress[0]).toEqual([0, 22]);
+    expect(progress.at(-1)).toEqual([9, 22]);
   });
 
-  it("packages the 16-file v4 vector bundle with all seven layered assets", async () => {
+  it("packages the 25-file vector bundle with all four paste masks and material reference", async () => {
     const { config, geometry, pointCodeArtwork } = fixture({
       subcellCount: 4,
       text: "SOLAR ORACLE WALKMAN",
@@ -1008,13 +1011,13 @@ describe("downloadProjectBundle", () => {
       new Uint8Array(await (downloaded as Blob).arrayBuffer()),
     );
     const paths = Object.keys(files);
-    expect(paths).toHaveLength(20);
+    expect(paths).toHaveLength(25);
     expect(paths.filter((path) => path.startsWith("svg-layered/"))).toHaveLength(
-      7,
+      10,
     );
     expect(
       paths.filter((path) => path.startsWith("svg-production/")),
-    ).toHaveLength(5);
+    ).toHaveLength(7);
     expect(paths.some((path) => path.startsWith("bitmap-production/"))).toBe(
       false,
     );
@@ -1029,6 +1032,8 @@ describe("downloadProjectBundle", () => {
         "svg-production/fto-etch-glass-6066.svg",
         "svg-production/screen-glass-6060-tio2.svg",
         "svg-production/screen-glass-6066-tio2.svg",
+        "svg-production/screen-glass-6060-pt.svg",
+        "svg-production/screen-glass-6066-pt.svg",
       ].sort(),
     );
     expect(paths.some((path) => /surlyn/i.test(path))).toBe(false);
@@ -1042,6 +1047,8 @@ describe("downloadProjectBundle", () => {
     expect(project.config.electrodeJitter).toBe(config.electrodeJitter);
     expect(project.config.ftoEtchWidthMm).toBe(0.08);
     expect(project.config).toEqual(config);
+    expect(project.pasteAssignment.cells[0]).toMatchObject({ bigger: "18NR-T", smaller: "PT-1" });
+    expect(project.pasteAssignment.cells[1]).toMatchObject({ bigger: "PT-1", smaller: "18NR-T" });
     expect(project.pointCodeArtwork).toEqual(pointCodeArtwork);
     expect(project).not.toHaveProperty("fontArtwork");
     expect(project.config).not.toHaveProperty("electrodeGapMm");
@@ -1119,7 +1126,9 @@ describe("downloadProjectBundle", () => {
 
     const readme = strFromU8(files["README.txt"]);
     for (const statement of [
-      "active region",
+      "實際印刷區",
+      "18NR-T",
+      "PT-1",
       "垂直注液",
       "SOLID HATCH",
       "開口模型",
@@ -1137,7 +1146,9 @@ describe("downloadProjectBundle", () => {
       `electrodeJitter = ${String(config.electrodeJitter)}（允許上限 2）`,
       "ftoEtchWidthMm = 0.08 mm（預設 0.08 mm）",
       "fabrication activeRegions",
-      "七個完整分層 SVG",
+      "十個完整圖層",
+      "materials-reference.svg",
+      "pasteAssignment",
       "校正警告",
     ]) {
       expect(readme).toContain(statement);
@@ -1155,13 +1166,13 @@ describe("downloadProjectBundle", () => {
       "w-series-dssc-galvo-toolpath-v4",
     );
 
-    expect(progress[0].slice(0, 2)).toEqual([0, 8]);
-    expect(progress.at(-1)?.slice(0, 2)).toEqual([8, 8]);
+    expect(progress[0].slice(0, 2)).toEqual([0, 10]);
+    expect(progress.at(-1)?.slice(0, 2)).toEqual([10, 10]);
     expect(anchor.download).toBe("w-series-dssc-project.zip");
     expect(anchor.click).toHaveBeenCalledOnce();
   });
 
-  it("packages exactly 24 files in the complete PDF and TIFF bundle", async () => {
+  it("packages exactly 37 files with four paste PDFs/TIFFs and a material reference", async () => {
     const { config, geometry, pointCodeArtwork } = fixture();
     const assets = buildFabricationAssets(config, geometry, pointCodeArtwork);
     let downloaded: Blob | undefined;
@@ -1199,7 +1210,9 @@ describe("downloadProjectBundle", () => {
     });
     vi.mocked(svgAssetToBilevelTiffBlob)
       .mockResolvedValueOnce(new Blob(["mock-6066-tiff"], { type: "image/tiff" }))
-      .mockResolvedValueOnce(new Blob(["mock-6060-tiff"], { type: "image/tiff" }));
+      .mockResolvedValueOnce(new Blob(["mock-6060-tiff"], { type: "image/tiff" }))
+      .mockResolvedValueOnce(new Blob(["mock-6066-pt-tiff"], { type: "image/tiff" }))
+      .mockResolvedValueOnce(new Blob(["mock-6060-pt-tiff"], { type: "image/tiff" }));
     const progress: Array<[number, number]> = [];
 
     await downloadProjectBundle(
@@ -1215,20 +1228,22 @@ describe("downloadProjectBundle", () => {
       new Uint8Array(await (downloaded as Blob).arrayBuffer()),
     );
     const paths = Object.keys(files);
-    expect(paths).toHaveLength(28);
+    expect(paths).toHaveLength(37);
     expect(paths.filter((path) => path.startsWith("svg-layered/"))).toHaveLength(
-      7,
+      10,
     );
     expect(
       paths.filter((path) => path.startsWith("svg-production/")),
-    ).toHaveLength(5);
-    expect(paths.filter((path) => path.endsWith(".pdf"))).toHaveLength(6);
+    ).toHaveLength(7);
+    expect(paths.filter((path) => path.endsWith(".pdf"))).toHaveLength(8);
     expect(
       paths.filter((path) => path.startsWith("bitmap-production/")).sort(),
     ).toEqual(
       [
         "bitmap-production/screen-glass-6060-tio2-1bit-1200dpi.tif",
         "bitmap-production/screen-glass-6066-tio2-1bit-1200dpi.tif",
+        "bitmap-production/screen-glass-6060-pt-1bit-1200dpi.tif",
+        "bitmap-production/screen-glass-6066-pt-1bit-1200dpi.tif",
       ].sort(),
     );
     expect(paths.filter((path) => !path.includes("/")).sort()).toEqual(
@@ -1240,8 +1255,8 @@ describe("downloadProjectBundle", () => {
         "process-estimates.json",
       ].sort(),
     );
-    expect(progress[0]).toEqual([0, 16]);
-    expect(progress.at(-1)).toEqual([16, 16]);
+    expect(progress[0]).toEqual([0, 22]);
+    expect(progress.at(-1)).toEqual([22, 22]);
     expect(anchor.click).toHaveBeenCalledOnce();
   });
 });

@@ -25,6 +25,8 @@ export interface Segment {
 }
 
 export interface DesignConfig {
+  /** Resolved vector source, never a visual SVG overlay. Kept with trial exports. */
+  artwork?: DesignArtwork;
   glass6066WidthMm: number;
   glassHeightMm: number;
   glass6060WidthMm: number;
@@ -79,6 +81,41 @@ export interface DesignConfig {
 /** Polygon -> rings -> points; first ring is exterior, subsequent rings are holes. */
 export type PolygonSet = Point[][][];
 
+export interface DesignArtwork {
+  format: "dssc-vector-artwork-v1";
+  id: string;
+  title: string;
+  widthMm: number;
+  heightMm: number;
+  regions: PolygonSet;
+  recipeJson?: string;
+  targetVocV: number;
+  targetIscMa: number;
+  voltageToleranceV: number;
+}
+
+export interface PatternReport {
+  sourceId: string;
+  mapped: PolygonSet;
+  scale: number;
+  sourceAreaMm2: number;
+  retainedAreaFraction: number;
+  additionalSealMm2: number;
+  channels: PolygonSet;
+  channelWidthMm: number;
+  scenarioValid: boolean;
+  ftoFragmentsValid: boolean;
+  flow: {
+    requiredWidthMm: number;
+    chambers: number;
+    reachableChambers: number;
+    cells: Array<{ cellNumber: number; fragments: number; reachableFragments: number }>;
+    pass: boolean;
+    monotoneDownwardVerified: false;
+    basis: "polygon-connectivity-and-eroded-clearance-not-fluid-simulation";
+  };
+}
+
 export interface FillPort extends Rect {
   from: number | "top";
   to: number | "bottom";
@@ -95,7 +132,10 @@ export interface IsolationRoute {
 }
 
 export interface FabricationGeometry {
+  /** Original convex coating envelopes; use cellCoating() for actual production regions. */
   activeRegions: Point[][];
+  activeShapes?: PolygonSet[];
+  pattern?: PatternReport;
   cellAreasMm2: number[];
   totalActiveMm2: number;
   areaCv: number;
@@ -229,8 +269,11 @@ export interface PointCodeArtwork {
 export type PreviewMode =
   | "assembly"
   | "circuit"
+  | "materials"
   | "glass-6066"
   | "glass-6060"
+  | "pt-6066"
+  | "pt-6060"
   | "etch-6066"
   | "etch-6060"
   | "binding";

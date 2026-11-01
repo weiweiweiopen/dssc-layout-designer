@@ -16,10 +16,9 @@ import {
   screenTiffFilename,
 } from "./export";
 import {
-  buildPointCodeArtwork,
   validatePointCodeArtwork,
 } from "./point-code";
-import { buildGeometry, validateDesign } from "./geometry";
+import { validateDesign } from "./geometry";
 import {
   DEFAULT_CONFIG,
   type DesignConfig,
@@ -38,11 +37,14 @@ import type { UiKey } from "./locales/en";
 import { parameterHelp, parameterLabel } from "./locales/parameters";
 import { diagnosticText, resolveDiagnostic } from "./locales/diagnostics";
 import { FTO_PRESETS } from "./electrical";
+import { persistArtworkTrial, readArtworkTrial, studioConfig } from "./studio-handoff";
+import { deriveDesign } from "./design";
+import { PatternPanel } from "./PatternPanel";
+import { MaterialDistribution } from "./MaterialDistribution";
 import type { FtoPreset } from "./model";
 import { DSSC_REFERENCE, VOLTAGE_OBSERVATIONS } from "./reference-data";
 import type { VoltageObservationId } from "./reference-data";
 import {
-  buildFabricationAssets,
   buildPreviewSvg,
   previewSize,
   type SvgAsset,
@@ -91,6 +93,8 @@ interface PanSession {
 const STORAGE_KEY = "w-series-voronoi-layout-v6";
 const SCREEN_6066_ASSET_ID = "screen-glass-6066-tio2";
 const SCREEN_6060_ASSET_ID = "screen-glass-6060-tio2";
+const PT_6066_ASSET_ID = "screen-glass-6066-pt";
+const PT_6060_ASSET_ID = "screen-glass-6060-pt";
 const MIN_PREVIEW_SCALE = 0.25;
 const MAX_PREVIEW_SCALE = 8;
 const FIT_CAMERA: PreviewCamera = { scale: 1, x: 0, y: 0 };
@@ -98,14 +102,32 @@ const FIT_CAMERA: PreviewCamera = { scale: 1, x: 0, y: 0 };
 const VIEWS: Array<{ id: PreviewMode; label: UiKey }> = [
   { id: "assembly", label: "Final Assembly" },
   { id: "circuit", label: "Circuit" },
+  { id: "materials", label: "Paste distribution" },
   { id: "glass-6066", label: "Screen Bigger" },
+  { id: "pt-6066", label: "Pt Screen Bigger" },
   { id: "glass-6060", label: "Screen Smaller" },
+  { id: "pt-6060", label: "Pt Screen Smaller" },
   { id: "etch-6066", label: "Etch Bigger" },
   { id: "etch-6060", label: "Etch Smaller" },
   { id: "binding", label: "Binding" },
 ];
 
 const VIEW_METADATA: Record<PreviewMode, ViewMetadata> = {
+  materials: {
+    layer: "Dwgs.PasteDistribution",
+    description: "pasteMapDescription",
+    legend: [{ swatch: "gray-fill", label: "TiO2 cell" }, { swatch: "hatch-fill", label: "Pt cell" }, { swatch: "white-fill", label: "noPastePrint" }],
+  },
+  "pt-6066": {
+    layer: "Fab.Screen.Bigger.PT-1",
+    description: "ptScreenDescription",
+    legend: [{ swatch: "black-fill", label: "pt1Print" }, { swatch: "white-fill", label: "noPtPrint" }],
+  },
+  "pt-6060": {
+    layer: "Fab.Screen.Smaller.PT-1",
+    description: "ptScreenDescription",
+    legend: [{ swatch: "black-fill", label: "pt1Print" }, { swatch: "white-fill", label: "noPtPrint" }],
+  },
   assembly: {
     layer: "User.Assembly",
     description: "Coatings and shared AB-313 stage; hatched ± areas mark exposed bigger-electrode FTO for zebra contacts.",
@@ -169,6 +191,8 @@ const VIEW_METADATA: Record<PreviewMode, ViewMetadata> = {
 };
 
 function loadInitialConfig(): DesignConfig {
+  const transferred=studioConfig(window.location.search);
+  if (transferred) return transferred;
   try {
     const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem("w-series-voronoi-layout-v5");
     if (!stored) return { ...DEFAULT_CONFIG, bindingWidthMm: Number(sealProcess(DEFAULT_CONFIG).recommendedBindingMm.toFixed(2)) };
@@ -194,13 +218,6 @@ function loadInitialConfig(): DesignConfig {
   } catch {
     return { ...DEFAULT_CONFIG };
   }
-}
-
-function deriveDesign(config: DesignConfig): DerivedDesign {
-  const geometry = buildGeometry(config);
-  const pointCodeArtwork = buildPointCodeArtwork(config, geometry);
-  const assets = buildFabricationAssets(config, geometry, pointCodeArtwork);
-  return { config, geometry, pointCodeArtwork, assets };
 }
 
 function Section({
@@ -318,11 +335,12 @@ const FTO_OPTIONS = [
 function App() {
   const { locale, setLocale, t } = useI18n();
   const msg = (message: string) => diagnosticText(message, locale);
-  const [config, setConfig] = useState<DesignConfig>(loadInitialConfig);
+  const [incoming] = useState(() => readArtworkTrial(window.location.search));
+  const [config, setConfig] = useState<DesignConfig>(() => incoming.config ?? loadInitialConfig());
   const [derived, setDerived] = useState<DerivedDesign>(() =>
     deriveDesign(config),
   );
-  const [mode, setMode] = useState<AppView>("assembly");
+  const [mode, setMode] = useState<AppView>(incoming.config?.artwork ? "circuit" : "assembly");
   const is3D = mode === "review-3d";
   const svgMode: PreviewMode = is3D ? "assembly" : mode;
   const [reviewSettings, setReviewSettings] = useState<ReviewSettings>(loadReviewSettings);
@@ -332,12 +350,13 @@ function App() {
       derived.config,
       derived.geometry,
       derived.pointCodeArtwork,
-      "assembly",
+      svgMode,
     ),
   );
   const [previewCamera, setPreviewCamera] = useState<PreviewCamera>(FIT_CAMERA);
   const [isPanning, setIsPanning] = useState(false);
   const [generationError, setGenerationError] = useState("");
+  const [searchBusy, setSearchBusy] = useState(false);
   const [exportError, setExportError] = useState("");
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(
     null,
@@ -346,9 +365,16 @@ function App() {
   const previewWorkspaceRef = useRef<HTMLDivElement>(null);
   const panSession = useRef<PanSession | null>(null);
   const deferredConfig = useDeferredValue(config);
-  const pending = deferredConfig !== config || derived.config !== config;
+  const pending = deferredConfig !== config || derived.config !== config || searchBusy;
 
+  const transientStudio = useRef(incoming.requested || Boolean(studioConfig(window.location.search)));
   useEffect(() => {
+    if (transientStudio.current) {
+      if (incoming.config?.artwork && config.artwork?.id === incoming.config.artwork.id) {
+        try { persistArtworkTrial(config); } catch { /* Original Layout reference is never replaced. */ }
+      }
+      return;
+    }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
     } catch {
@@ -362,7 +388,19 @@ function App() {
   }, [reviewSettings]);
 
   useEffect(() => {
+    if (derived.config === deferredConfig) return;
+    let worker: Worker | null = null;
     const timer = window.setTimeout(() => {
+      if (deferredConfig.artwork) {
+        worker = new Worker(new URL("./layout.worker.ts", import.meta.url), { type: "module" });
+        worker.onmessage = (event: MessageEvent<{ kind: string; result: DerivedDesign; error: string }>) => {
+          if (event.data.kind === "error") { setGenerationError(event.data.error); return; }
+          startTransition(() => { setDerived({ ...event.data.result, config: deferredConfig }); setGenerationError(""); });
+        };
+        worker.onerror = (event) => setGenerationError(event.message);
+        worker.postMessage({ kind: "derive", config: deferredConfig });
+        return;
+      }
       try {
         const next = deriveDesign(deferredConfig);
         startTransition(() => {
@@ -375,7 +413,7 @@ function App() {
         );
       }
     }, 35);
-    return () => window.clearTimeout(timer);
+    return () => { window.clearTimeout(timer); worker?.terminate(); };
   }, [deferredConfig]);
 
   useEffect(() => {
@@ -488,7 +526,7 @@ function App() {
       derived.pointCodeArtwork,
     ),
   ];
-  const blocking = warnings.some(({ severity }) => severity === "error");
+  const blocking = Boolean(incoming.error) || warnings.some(({ severity }) => severity === "error");
   const currentPreviewSize = previewSize(derived.geometry, svgMode);
   const sealView = mode === "assembly" || mode === "binding" || is3D;
   const viewMetadata = is3D ? { layer: "User.Review3D", description: t("reviewDescription"), legend: [] } : { ...VIEW_METADATA[svgMode],
@@ -501,6 +539,8 @@ function App() {
     derived.assets.find((asset) => asset.id === id);
   const screen6066Asset = assetById(SCREEN_6066_ASSET_ID);
   const screen6060Asset = assetById(SCREEN_6060_ASSET_ID);
+  const pt6066Asset = assetById(PT_6066_ASSET_ID);
+  const pt6060Asset = assetById(PT_6060_ASSET_ID);
 
   const downloadCurrentView = () => {
     if (is3D || blocking || generationError || pending || exportLock.current) return;
@@ -515,7 +555,7 @@ function App() {
   };
 
   const downloadScreen = async (id: string) => {
-    if (exportLock.current) return;
+    if (exportLock.current || blocking || generationError || pending || searchBusy) return;
     const asset = assetById(id);
     if (!asset) {
       setExportError(`Screen asset "${id}" is unavailable.`);
@@ -544,7 +584,7 @@ function App() {
   };
 
   const exportBundle = async (includePdfs: boolean) => {
-    if (exportLock.current) return;
+    if (exportLock.current || blocking || generationError || pending || searchBusy) return;
     exportLock.current = true;
     setExportError("");
     setExportProgress({ completed: 0, total: 1, label: "Preparing output" });
@@ -567,7 +607,9 @@ function App() {
   };
 
   const outputDisabled =
-    blocking || Boolean(generationError) || pending || exportProgress !== null;
+    blocking || Boolean(generationError) || pending || searchBusy || exportProgress !== null;
+
+  if (incoming.error) return <main className="pattern-transfer-error"><h1>{locale === "zh-TW" ? "圖案移交未完成" : "Artwork transfer failed"}</h1><p role="alert">{msg(incoming.error)}</p><a href="?studio=type">← Studio</a><a href="?">DSSC Layout</a></main>;
 
   return (
     <HelpProvider><div className="classic-window">
@@ -575,6 +617,8 @@ function App() {
         <span className="close-box" aria-hidden="true" />
         <h1>{t("title")}</h1>
         <div className="title-actions">
+          <a href="?studio=type" title="字形與幾何視覺研究" style={{color:"inherit",fontSize:12,marginRight:8}}>TYPE + GEOMETRY ↗</a>
+          {transientStudio.current && <span title="此設計不會覆寫之前的本機設定" style={{fontSize:11}}>暫存設計</span>}
           <div className="language-switch" role="group" aria-label="Language / 語言">
             <button type="button" lang="zh-TW" data-testid="language-zh-TW" aria-pressed={locale === "zh-TW"}
               onMouseDown={(event) => event.preventDefault()} onClick={() => setLocale("zh-TW")}>繁中</button>
@@ -627,6 +671,10 @@ function App() {
             </button>
             </Help>
           </div>
+
+          {config.artwork && <PatternPanel config={config} geometry={derived.geometry} locale={locale} pending={pending}
+            autoSearch={incoming.autoSearch} onConfig={setConfig} onBusy={setSearchBusy}/>}
+          <MaterialDistribution config={derived.config} geometry={derived.geometry}/>
 
           <Section title="Electrode Glass">
             <NumberRow
@@ -901,25 +949,35 @@ function App() {
             {estimated.issues.length ? <div className="info-well" role="status">{estimated.issues.map(msg).join(" ")}</div> : null}
           </Section>
 
-          <Section title="TiO2 Screens">
+          <Section title="Paste Screens">
             <div className="button-column">
               <Help content="較大電極的 TiO₂ 網版：1200 DPI、實際尺寸、true 1-bit TIFF。黑色印 TiO₂，白色是 Pt／封膠退讓／不印刷區。">
               <button
                 className="important-button"
+                data-testid="download-bigger-tio2"
                 disabled={outputDisabled || !screen6066Asset}
                 onClick={() => void downloadScreen(SCREEN_6066_ASSET_ID)}
               >
                 {t("Download Bigger Electrode TiO2 TIFF")}
               </button>
               </Help>
+              <Help content="PT-1 鉑漿料獨立網版：黑色為該片電極的實際 Pt 印刷區，不是 TiO₂ 正片的整片反相。小片沿用製造鏡射；留白、膠與接觸條不印漿料。"
+                contentEn="Independent PT-1 platinum-paste masks: black is actual Pt coating on that electrode, not a whole-page inversion of the TiO2 screen. The smaller plate uses the fabrication mirror. Blank, adhesive and contact regions remain unprinted.">
+              <button className="important-button" data-testid="download-bigger-pt" disabled={outputDisabled || !pt6066Asset} onClick={() => void downloadScreen(PT_6066_ASSET_ID)}>{t("Download Bigger Electrode Pt TIFF")}</button>
+              </Help>
               <Help content="較小電極的 TiO₂ 網版：1200 DPI、實際尺寸、true 1-bit TIFF。黑色印 TiO₂，白色不印；預設製造座標含水平鏡射，勿再重複鏡射。">
               <button
                 className="important-button"
+                data-testid="download-smaller-tio2"
                 disabled={outputDisabled || !screen6060Asset}
                 onClick={() => void downloadScreen(SCREEN_6060_ASSET_ID)}
               >
                 {t("Download Smaller Electrode TiO2 TIFF")}
               </button>
+              </Help>
+              <Help content="PT-1 小片網版採導電面朝上的單片局部座標，預設水平鏡射；請與材料分布圖核對，勿重複鏡射。"
+                contentEn="The smaller PT-1 mask uses conductive-side local coordinates and the configured horizontal mirror. Check the material-distribution reference and do not mirror it twice.">
+              <button className="important-button" data-testid="download-smaller-pt" disabled={outputDisabled || !pt6060Asset} onClick={() => void downloadScreen(PT_6060_ASSET_ID)}>{t("Download Smaller Electrode Pt TIFF")}</button>
               </Help>
               <Help content="完整製造 ZIP：含向量 PDF、SVG、1200 DPI 1-bit TIFF、DXF、雷射填掃 SVG／JSON、設定與估算明細。正式膠版固定為印刷幾何；壓合預覽不會改動它。">
               <button
@@ -1060,7 +1118,7 @@ function App() {
               {t("scenario")} {derived.geometry.fabrication.openingScenario.valid ? `${derived.geometry.fabrication.minimumChannelMm.toFixed(3)} mm` : t("invalid")} ·{" "}
               {derived.geometry.fabrication.openingScenario.source === "measured-wet-film" ? t("measuredOpeningNote") : t("unmeasuredOpeningNote")}
             </div> : null}
-            {mode === "etch-6066" || mode === "circuit" ? <div className="preview-stats" data-testid="terminal-check"
+            {mode === "etch-6066" || mode === "circuit" || mode === "materials" ? <div className="preview-stats" data-testid="terminal-check"
               data-isolated={derived.geometry.fabrication.terminalCheck.isolated ? "true" : "false"}>
               <strong>{t("biggerFto")}:</strong>{" "}
               − → {t("cell")} 1 {derived.geometry.fabrication.terminalCheck.negativeConnected ? t("ok") : t("open")} ·{" "}
@@ -1068,7 +1126,7 @@ function App() {
               − / + {derived.geometry.fabrication.terminalCheck.isolated ? t("isolated") : t("short")} ·{" "}
               {t("strips")} {derived.geometry.fabrication.terminalCheck.negativeStripContinuous && derived.geometry.fabrication.terminalCheck.positiveStripContinuous ? t("continuous") : t("broken")}
             </div> : null}
-            {mode !== "circuit" ? <div className="preview-stats" data-testid="glass-boundary">
+            {mode !== "circuit" && mode !== "materials" ? <div className="preview-stats" data-testid="glass-boundary">
               {t("glassBoundary", { w: currentPreviewSize.widthMm.toFixed(1), h: currentPreviewSize.heightMm.toFixed(1) })}
               {mode === "etch-6066" || mode === "etch-6060" ? ` · ${t("bleed", { count: derived.geometry.fabrication.bleedCheck[mode === "etch-6066" ? "glass-6066" : "glass-6060"].count })}` : ""}
             </div> : null}

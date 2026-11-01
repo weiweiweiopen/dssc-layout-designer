@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { unzipSync } from "fflate";
 import puppeteer from "puppeteer-core";
+import { closeTestBrowser } from './browser-cleanup.mjs';
 
 const url = process.env.APP_URL ?? "http://127.0.0.1:5173";
 const ensure = (value, message) => { if (!value) throw new Error(message); };
@@ -92,6 +93,16 @@ try {
   });
   await sleep(200);
   ensure((await settings()).biggerDye === "custom" && (await settings()).biggerColor === "#118833" && (await settings()).smallerDye === "amber", "Custom dye changed the other electrode");
+  const fullPasteLayerCount=Number(await page.$eval('[data-testid="review-canvas"]',el=>el.dataset.layerCount));
+  await page.click('[data-review-toggle="pt"]');
+  ensure(Number(await page.$eval('[data-testid="review-canvas"]',el=>el.dataset.layerCount))===fullPasteLayerCount-2 && (await settings()).tio2,"PT-1 cannot be inspected separately from 18NR-T");
+  await page.click('[data-review-toggle="tio2"]');
+  ensure(Number(await page.$eval('[data-testid="review-canvas"]',el=>el.dataset.layerCount))===fullPasteLayerCount-4,"18NR-T toggle hid the wrong layers");
+  await page.click('[data-review-toggle="tio2"]');await page.click('[data-review-toggle="pt"]');
+  for(const background of ['dark','light','transparent']){
+    await page.select('[data-testid="review-background"]',background);await sleep(150);
+    ensure((await settings()).background===background,'Background mode did not persist independently');
+  }
 
   const drag = async (button, shift = false) => {
     const box = await (await page.$('[data-testid="review-canvas"]')).boundingBox();
@@ -144,7 +155,7 @@ try {
   await page.click('[data-testid="seal-stage-toggle"]');
   ensure(JSON.stringify(await engineering()) === JSON.stringify(beforeEngineering), "Appearance changed engineering configuration, area or current");
   const afterBundle = await bundle();
-  ensure(Object.keys(beforeBundle).length === 20 && Object.keys(afterBundle).length === 20 &&
+  ensure(Object.keys(beforeBundle).length === 25 && Object.keys(afterBundle).length === 25 &&
     Object.entries(beforeBundle).every(([name, data]) => afterBundle[name] && Buffer.from(data).equals(Buffer.from(afterBundle[name]))),
   "3D appearance or preview stage altered exported vector file contents");
   await clickView("assembly");
@@ -176,10 +187,10 @@ try {
   await unavailable.$eval('[data-view-mode="assembly"]', (button) => button.click());
   await unavailable.waitForSelector('.preview-frame svg[data-view="assembly"]');
   await unavailable.close();
-  console.log(`PASS: 3D WebGL rendering, independent dyes, camera gestures, preset views, projections, layers, bilingual persistence, responsive layout and byte-identical 20-file vector exports. Screenshots: ${directory}`);
+  console.log(`PASS: 3D WebGL rendering, independent paste layers/dyes, camera gestures, preset views, projections, bilingual persistence, responsive layout and byte-identical 25-file vector exports. Screenshots: ${directory}`);
 } catch (error) {
   console.error(`3D browser check failed. Artifacts: ${directory}. Browser errors:`, errors);
   const page = (await browser.pages()).at(-1);
   if (page) await page.screenshot({ path: join(directory, "failure.png") }).catch(() => {});
   throw error;
-} finally { await browser.close(); }
+} finally { await closeTestBrowser(browser); }

@@ -80,8 +80,12 @@ describe("canonical 3D review geometry", () => {
       thinLayerScale: 10000, explodeMm: -10, glassThicknessMm: 0, glass: false, fto: "false", biggerColor: "url(bad)" }));
     expect(reviewDyeColor(settings, "glass-6066")).toBe("#376c9d");
     expect(reviewDyeColor(settings, "glass-6060")).toBe("#007733");
-    expect(settings).toMatchObject({ thinLayerScale: 100, explodeMm: 0, glassThicknessMm: 0.5, glass: false, fto: true, biggerColor: "#812f40" });
+    expect(settings).toMatchObject({ thinLayerScale: 100, explodeMm: 0, glassThicknessMm: 0.5, glass: false, fto: true, biggerColor: "#812f40", tio2: true, pt: true });
     expect(parseReviewSettings("{")).toEqual(DEFAULT_REVIEW_SETTINGS);
     expect(parseReviewSettings('{"biggerDye":"constructor","smallerDye":"unknown"}')).toEqual(DEFAULT_REVIEW_SETTINGS);
+    expect(parseReviewSettings('{"thinLayerScale":40}').background).toBe('transparent');
+    expect(parseReviewSettings('{"background":"dark"}').background).toBe('dark');
+    expect(parseReviewSettings('{"background":"light"}').background).toBe('light');
+    expect(parseReviewSettings('{"background":"url(bad)"}').background).toBe('transparent');
   });
 });

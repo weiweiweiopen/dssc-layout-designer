@@ -6,6 +6,7 @@ import { buildIsolationRoutes } from "./isolation";
 import { bleedCheck as checkBleeds } from "./etch";
 import { boundarySegments, coatingInset, minimumSealGap } from "./coating";
 import { buildRetainedFto, checkFtoConnectivity } from "./fto-connectivity";
+import { applyArtworkPattern } from "./pattern-fabrication";
 
 type BaseGeometry = Omit<LayoutGeometry, "fabrication">;
 
@@ -187,11 +188,12 @@ export function buildFabricationGeometry(c: DesignConfig, g: BaseGeometry): Fabr
   errors.push(...connectivity.errors);
   const terminalCheck = { ...connectivity.terminalCheck,
     fullHeightIsolation: isolationRoutes["glass-6066"].every((r) => r.continuousTopToBottom) };
-  return { activeRegions, cellAreasMm2, totalActiveMm2, areaCv, coatingClearance, sealPrint, sealAssembled, ports, retainedFto,
+  const result: FabricationGeometry = { activeRegions, cellAreasMm2, totalActiveMm2, areaCv, coatingClearance, sealPrint, sealAssembled, ports, retainedFto,
     sealPrintAreaMm2: setArea(sealPrint), volumeSpreadMm: volumeSpread, envelopeSpreadMm: spread,
     minimumChannelMm: ports.length ? Math.min(...ports.map((p) => p.finalWidthMm)) : 0,
     minimumPrintedChannelMm: ports.length ? Math.min(...ports.map((p) => p.printedWidthMm)) : 0,
     openingScenario: { filmUm: process.openingFilmUm, source: process.openingFilmSource,
       volumeSpreadMm: scenarioVolumeSpread, valid: process.openingScenarioValid && scenarioVolumeSpread !== null },
     compressionValid: process.compressionValid && volumeSpread !== null, terminalCheck, isolationRoutes, bleedCheck, errors: [...new Set(errors)] };
+  return c.artwork ? applyArtworkPattern(c, g, result) : result;
 }

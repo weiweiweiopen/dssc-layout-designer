@@ -4,7 +4,8 @@ import { sealProcess } from "./process";
 import { buildBleedEtchPaths } from "./etch";
 import { insetConvexPolygon } from "./point-code";
 import { coatingInset } from "./coating";
-import { rectRing, shape } from "./polygons";
+import { componentAt, rectRing, shape } from "./polygons";
+import { mapArtwork, parseDesignArtwork } from "./artwork-source";
 import { buildRetainedFto, checkFtoConnectivity } from "./fto-connectivity";
 
 import type {
@@ -621,12 +622,23 @@ function balanceVoronoi(initial: VoronoiResult, active: Rect, config: DesignConf
   const planningSpread = (volumeOffsetForFootprint(printedSealFootprint(overlap, initial.polygons, config.bindingWidthMm),
     shape(rectRing(overlap)), process.openingVolumeRatio) ?? process.openingVolumeSpreadMm ?? 0) + process.allowanceMm;
   const clearance = coatingInset(config, planningSpread).insetMm;
+  // Pattern density guides the partition search. Final areas are independently
+  // recomputed from exact polygons after glue / channel compensation.
+  const mapped = config.artwork ? mapArtwork(config.artwork, active).polygons : null;
+  const density = mapped ? Array.from({ length: 36 * 36 }, (_, i) => ({
+    x: active.x + ((i % 36) + 0.5) * active.width / 36,
+    y: active.y + (Math.floor(i / 36) + 0.5) * active.height / 36,
+  })).filter((p) => componentAt(p, mapped) >= 0) : null;
   const score = (candidate: VoronoiResult) => {
-    const areas = candidate.polygons.map((r) => polygonArea(insetConvexPolygon(r, clearance)));
+    const areas = candidate.polygons.map((r) => {
+      const inset = insetConvexPolygon(r, clearance);
+      return density ? density.filter((p) => pointInConvexPolygon(p, inset)).length * active.width * active.height / (36 * 36) : polygonArea(inset);
+    });
     const mean = areas.reduce((s, a) => s + a, 0) / areas.length;
-    if (!(mean > 0) || Math.min(...areas) <= 0) return Infinity;
+    if (!(mean > 0) || !density && Math.min(...areas) <= 0) return Infinity;
     return areas.reduce((s, a) => s + (a - mean) ** 2, 0) / (areas.length * mean ** 2)
-      - 0.15 * Math.min(...areas) / mean - 0.05 * mean * areas.length / (active.width * active.height);
+      - 0.15 * Math.min(...areas) / mean - 0.05 * mean * areas.length / (active.width * active.height)
+      + (density ? areas.filter((a) => a <= 0).length * 2 : 0);
   };
   let best = initial, bestScore = score(initial);
   // Search can cross a cocircular / tiny-edge intermediate state (notably
@@ -775,6 +787,7 @@ function canonicalEtchPaths(
 }
 
 export function buildGeometry(config: DesignConfig): LayoutGeometry {
+  if (config.artwork) config = { ...config, artwork: parseDesignArtwork(config.artwork) };
   const glass6066: Rect = {
     x: 0,
     y: 0,
